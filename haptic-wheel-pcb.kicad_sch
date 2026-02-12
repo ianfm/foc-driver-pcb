@@ -1,13 +1,15 @@
 (kicad_sch
-	(version 20231120)
+	(version 20250114)
 	(generator "eeschema")
-	(generator_version "8.0")
+	(generator_version "9.0")
 	(uuid "e21c8454-2075-4252-af99-7ade24ed1d36")
 	(paper "A4")
 	(lib_symbols
 		(symbol "Connector:Screw_Terminal_01x02"
 			(pin_names
-				(offset 1.016) hide)
+				(offset 1.016)
+				(hide yes)
+			)
 			(exclude_from_sim no)
 			(in_bom yes)
 			(on_board yes)
@@ -84,9 +86,10 @@
 						(type background)
 					)
 				)
-				(circle
-					(center 0 -2.54)
-					(radius 0.635)
+				(polyline
+					(pts
+						(xy -0.5334 0.3302) (xy 0.3302 -0.508)
+					)
 					(stroke
 						(width 0.1524)
 						(type default)
@@ -109,7 +112,7 @@
 				)
 				(polyline
 					(pts
-						(xy -0.5334 0.3302) (xy 0.3302 -0.508)
+						(xy -0.3556 0.508) (xy 0.508 -0.3302)
 					)
 					(stroke
 						(width 0.1524)
@@ -131,10 +134,9 @@
 						(type none)
 					)
 				)
-				(polyline
-					(pts
-						(xy -0.3556 0.508) (xy 0.508 -0.3302)
-					)
+				(circle
+					(center 0 0)
+					(radius 0.635)
 					(stroke
 						(width 0.1524)
 						(type default)
@@ -144,7 +146,7 @@
 					)
 				)
 				(circle
-					(center 0 0)
+					(center 0 -2.54)
 					(radius 0.635)
 					(stroke
 						(width 0.1524)
@@ -191,12 +193,14 @@
 					)
 				)
 			)
+			(embedded_fonts no)
 		)
 	)
 	(text_box "Component selection notes\n1. See gate driver options. \n  - recommended CSD18536KCS (TO-220 package) but \n  - prefer SMD option CSD18534Q5A\n"
 		(exclude_from_sim yes)
 		(at 308.61 15.24 0)
 		(size 67.31 44.45)
+		(margins 0.9525 0.9525 0.9525 0.9525)
 		(stroke
 			(width 0)
 			(type default)
@@ -352,6 +356,10 @@
 	(sheet
 		(at 0 434.34)
 		(size 297.18 173.99)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
 		(fields_autoplaced yes)
 		(stroke
 			(width 0.1524)
@@ -392,6 +400,10 @@
 	(sheet
 		(at -2.54 642.62)
 		(size 298.45 233.68)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
 		(fields_autoplaced yes)
 		(stroke
 			(width 0.1524)
@@ -430,6 +442,10 @@
 	(sheet
 		(at -1.27 228.6)
 		(size 299.72 180.34)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
 		(fields_autoplaced yes)
 		(stroke
 			(width 0.1524)
@@ -470,4 +486,5 @@
 			(page "1")
 		)
 	)
+	(embedded_fonts no)
 )
