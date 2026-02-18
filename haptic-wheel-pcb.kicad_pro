@@ -38,8 +38,8 @@
         "other_text_upright": false,
         "pads": {
           "drill": 0.0,
-          "height": 4.459998,
-          "width": 4.28027
+          "height": 0.599999,
+          "width": 0.23
         },
         "silk_line_width": 0.1,
         "silk_text_italic": false,
@@ -473,7 +473,7 @@
     "classes": [
       {
         "bus_width": 12,
-        "clearance": 0.15,
+        "clearance": 0.25,
         "diff_pair_gap": 0.25,
         "diff_pair_via_gap": 0.25,
         "diff_pair_width": 0.2,
@@ -519,20 +519,7 @@
     },
     "net_colors": null,
     "netclass_assignments": null,
-    "netclass_patterns": [
-      {
-        "netclass": "Default",
-        "pattern": "/Motor Control/MOT_A"
-      },
-      {
-        "netclass": "Power",
-        "pattern": "/Motor Control/MOT_A"
-      },
-      {
-        "netclass": "motor",
-        "pattern": "/Motor Control/SPB"
-      }
-    ]
+    "netclass_patterns": []
   },
   "pcbnew": {
     "last_paths": {
