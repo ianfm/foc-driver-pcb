@@ -1,16 +1,30 @@
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "driver/spi_master.h"
 #include "driver/i2c_master.h"
 #include "driver/mcpwm_prelude.h"
 #include "esp_adc/adc_continuous.h"
+#include "web_ui.h"
 
 #define TAG "FOC_DRIVER"
+
+#define WIFI_SSID      "ESP32-FOC-Driver"
+#define WIFI_PASS      "12345678"
+#define WIFI_CHANNEL   1
+#define MAX_STA_CONN   4
 
 // =========================================================================
 // 1. PIN DEFINITIONS (ESP32-S3-WROOM-1 N16R8 PINOUT)
@@ -53,14 +67,19 @@
 // =========================================================================
 // 2. MOTOR & CONTROL LOOP PARAMETERS
 // =========================================================================
-#define POLE_PAIRS          7          // Number of magnetic pole pairs
-#define SUPPLY_VOLTAGE      24.0f      // DC Bus Voltage (Volts)
+#define POLE_PAIRS              7          // Number of magnetic pole pairs
+#define SUPPLY_VOLTAGE          24.0f      // DC Bus Voltage (Volts)
+
+// Current Sensing Constants
+#define SHUNT_RESISTANCE_OHMS   0.010f     // 10 mOhm low-side current shunts
+#define CSA_GAIN_V_PER_V        10.0f      // DRV8323 Current Sense Amp Gain (10 V/V)
+#define CSA_BIAS_VOLTS          1.65f      // VREF/2 midpoint bias (1.65V at 3.3V VREF)
 
 // Center-Aligned MCPWM Configuration (25 kHz switching frequency)
-#define MCPWM_TIMER_RES_HZ  40000000   // 40 MHz MCPWM clock resolution
-#define PWM_FREQ_HZ         25000      // 25 kHz PWM frequency
+#define MCPWM_TIMER_RES_HZ      40000000   // 40 MHz MCPWM clock resolution
+#define PWM_FREQ_HZ             25000      // 25 kHz PWM frequency
 // Up-Down count mode: f_pwm = f_timer / (2 * period_ticks) => 40MHz / (2 * 25kHz) = 800 ticks
-#define PWM_MAX_DUTY        (MCPWM_TIMER_RES_HZ / (2 * PWM_FREQ_HZ)) // 800 ticks
+#define PWM_MAX_DUTY            (MCPWM_TIMER_RES_HZ / (2 * PWM_FREQ_HZ)) // 800 ticks
 
 // =========================================================================
 // 3. PERIPHERAL HANDLES & FOC STATE
@@ -70,11 +89,18 @@ static i2c_master_dev_handle_t  as5600_handle;
 static mcpwm_cmpr_handle_t      comparators[3];
 static adc_continuous_handle_t  adc_handle;
 
-// FOC Targets and State
-volatile float    target_Vq            = 0.0f;  // Torque voltage target (V)
-volatile float    target_Vd            = 0.0f;  // Flux voltage target (V)
+// FOC Targets, Measurements, and Runtime Tunable Parameters
+volatile float    target_Vq            = 0.0f;  // Torque voltage target (V) - Runtime adjustable
+volatile float    target_Vd            = 0.0f;  // Flux voltage target (V) - Runtime adjustable
+volatile float    current_limit_amps   = 1.0f;  // Max continuous phase current limit (A) - Runtime adjustable
+volatile float    emergency_trip_amps  = 1.5f;  // Emergency shutdown trip threshold (A) - Runtime adjustable
+
+volatile float    measured_Iq          = 0.0f;  // Measured torque current (Amps)
+volatile float    measured_Id          = 0.0f;  // Measured flux current (Amps)
+volatile float    measured_I_mag       = 0.0f;  // Total current magnitude (Amps)
 volatile float    electrical_angle     = 0.0f;  // Electrical angle [0, 2*PI)
 volatile uint16_t as5600_zero_offset   = 0;     // Calibrated zero angle offset
+volatile bool     overcurrent_tripped  = false; // Latched overcurrent trip flag
 
 // =========================================================================
 // 4. DRV8323S SPI DRIVER
@@ -122,6 +148,45 @@ void drv_write_reg(uint8_t addr, uint16_t val) {
         .tx_data = { (uint8_t)(tx >> 8), (uint8_t)(tx & 0xFF) }
     };
     spi_device_polling_transmit(drv_spi, &t);
+}
+
+bool drv_safety_configure(void) {
+    ESP_LOGI(TAG, "Configuring DRV8323 hardware safety registers...");
+
+    // Reg 0x03: Unlock registers + HS Slew Rate (120mA Source / 240mA Sink)
+    // LOCK=011b (Unlock), IDRIVEP_HS=0100b (120mA), IDRIVEN_HS=0100b (240mA)
+    uint16_t hs_val = (0x03 << 8) | (0x04 << 4) | (0x04);
+    drv_write_reg(0x03, hs_val);
+
+    // Reg 0x04: LS Gate Drive (Latched Fault, 2000ns TDRIVE, 120mA Source / 240mA Sink)
+    // CBC=0 (Latched fault), TDRIVE=10b (2000ns), IDRIVEP_LS=0100b (120mA), IDRIVEN_LS=0100b (240mA)
+    uint16_t ls_val = (0x00 << 10) | (0x02 << 8) | (0x04 << 4) | (0x04);
+    drv_write_reg(0x04, ls_val);
+
+    // Reg 0x05: OCP Control (200ns Dead-Time, Latched Shutdown Mode, 2us Deglitch, 0.06V lowest VDS threshold)
+    // TRETRY=0 (4ms), DEAD_TIME=10b (200ns), OCP_MODE=00b (Latched fault), OCP_DEG=01b (2us), VDS_LVL=0000b (0.06V - maximum sensitivity)
+    uint16_t ocp_val = (0x00 << 10) | (0x02 << 8) | (0x00 << 6) | (0x01 << 4) | (0x00);
+    drv_write_reg(0x05, ocp_val);
+
+    // Reg 0x06: CSA Control (Bidirectional VREF/2 Midpoint Bias, 10 V/V Gain)
+    // CSA_FET=0 (SPx/SNx), VREF_DIV=0 (VREF/2 enabled), CSA_GAIN=01b (10 V/V), DIS_SEN=0
+    uint16_t csa_val = (0x00 << 10) | (0x00 << 9) | (0x01 << 6);
+    drv_write_reg(0x06, csa_val);
+
+    // Reg 0x02: Driver Control (3x PWM Mode, Enable UVLO & Gate Fault monitoring, Report OTW)
+    // DIS_CPUV=0, DIS_GDF=0, OTW_REP=1, PWM_MODE=001b (3x PWM), COAST=0, BRAKE=0, CLR_FLT=0
+    uint16_t ctrl_val = (0x01 << 8) | (0x01 << 5);
+    drv_write_reg(0x02, ctrl_val);
+
+    // Read back and log all configuration registers
+    ESP_LOGI(TAG, "--- DRV8323 Register Audit ---");
+    for (uint8_t reg = 0x02; reg <= 0x06; reg++) {
+        uint16_t r = drv_read_reg(reg) & 0x7FF;
+        ESP_LOGI(TAG, "  Reg 0x%02X: Readback = 0x%04X", reg, r);
+    }
+
+    ESP_LOGI(TAG, "DRV8323 hardware safety configurations active (Dead Time: 200ns, OCP: Latched Shutdown, IDRIVE: 120mA/240mA).");
+    return true;
 }
 
 // =========================================================================
@@ -214,7 +279,7 @@ void adc_init(void) {
         .pattern_num    = 3,
         .sample_freq_hz = 20000,
         .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
-        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1
+        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2
     };
 
     adc_digi_pattern_config_t p_cfg[3] = {
@@ -251,29 +316,89 @@ static inline void update_electrical_angle(uint16_t raw_as5600) {
 }
 
 static inline void foc_loop_tick(void) {
+    // Check if system is in emergency tripped state
+    if (overcurrent_tripped) {
+        mcpwm_comparator_set_compare_value(comparators[0], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
+        mcpwm_comparator_set_compare_value(comparators[1], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
+        mcpwm_comparator_set_compare_value(comparators[2], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
+        return;
+    }
+
+    // 1. Read Phase Currents from ADC DMA
+    uint8_t result_buf[256];
+    uint32_t ret_num = 0;
+    float ia = 0.0f, ib = 0.0f, ic = 0.0f;
+    int samples_a = 0, samples_b = 0, samples_c = 0;
+
+    esp_err_t ret = adc_continuous_read(adc_handle, result_buf, sizeof(result_buf), &ret_num, 0);
+    if (ret == ESP_OK && ret_num > 0) {
+        for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+            adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result_buf[i];
+            uint32_t chan = p->type2.channel;
+            uint32_t val  = p->type2.data;
+            float v_sens = ((float)val / 4095.0f) * 3.3f;
+            float current = (v_sens - CSA_BIAS_VOLTS) / (SHUNT_RESISTANCE_OHMS * CSA_GAIN_V_PER_V);
+
+            if (chan == PIN_SOA_ADC_CH) { ia += current; samples_a++; }
+            else if (chan == PIN_SOB_ADC_CH) { ib += current; samples_b++; }
+            else if (chan == PIN_SOC_ADC_CH) { ic += current; samples_c++; }
+        }
+        if (samples_a > 0) ia /= (float)samples_a;
+        if (samples_b > 0) ib /= (float)samples_b;
+        if (samples_c > 0) ic /= (float)samples_c;
+    }
+
+    // 2. Clarke & Park Transforms for measured current
     float s = sinf(electrical_angle);
     float c = cosf(electrical_angle);
 
-    // 1. Inverse Park Transform (d-q -> alpha-beta)
-    float v_alpha = target_Vd * c - target_Vq * s;
-    float v_beta  = target_Vd * s + target_Vq * c;
+    float i_alpha = ia;
+    float i_beta  = 0.577350269f * (ia + 2.0f * ib); // 1/sqrt(3) = 0.577350269
 
-    // 2. Inverse Clarke Transform (alpha-beta -> a-b-c)
+    measured_Id = i_alpha * c + i_beta * s;
+    measured_Iq = -i_alpha * s + i_beta * c;
+    measured_I_mag = sqrtf(measured_Id * measured_Id + measured_Iq * measured_Iq);
+
+    // 3. HARDWARE PROTECTION: Instant Emergency Current Trip
+    if (measured_I_mag > emergency_trip_amps) {
+        overcurrent_tripped = true;
+        gpio_set_level(PIN_DRV_EN, 0); // Immediately pull DRV8323 ENABLE LOW (kill gates)
+        mcpwm_comparator_set_compare_value(comparators[0], 0);
+        mcpwm_comparator_set_compare_value(comparators[1], 0);
+        mcpwm_comparator_set_compare_value(comparators[2], 0);
+        return;
+    }
+
+    // 4. SOFTWARE CURRENT LIMITING: Dynamic Voltage Clamping
+    float vq_cmd = target_Vq;
+    float vd_cmd = target_Vd;
+
+    if (measured_I_mag > current_limit_amps && measured_I_mag > 0.001f) {
+        float scale = current_limit_amps / measured_I_mag;
+        vq_cmd *= scale;
+        vd_cmd *= scale;
+    }
+
+    // 5. Inverse Park Transform (d-q -> alpha-beta)
+    float v_alpha = vd_cmd * c - vq_cmd * s;
+    float v_beta  = vd_cmd * s + vq_cmd * c;
+
+    // 6. Inverse Clarke Transform (alpha-beta -> a-b-c)
     float v_a = v_alpha;
     float v_b = -0.5f * v_alpha + (0.8660254f * v_beta); // sqrt(3)/2 = 0.8660254
     float v_c = -0.5f * v_alpha - (0.8660254f * v_beta);
 
-    // 3. Normalize and center duty cycle at 50%
+    // 7. Normalize and center duty cycle at 50%
     float duty_a = (v_a / SUPPLY_VOLTAGE) + 0.5f;
     float duty_b = (v_b / SUPPLY_VOLTAGE) + 0.5f;
     float duty_c = (v_c / SUPPLY_VOLTAGE) + 0.5f;
 
-    // 4. Clamp outputs within [0.0, 1.0]
+    // 8. Clamp outputs within [0.0, 1.0]
     if (duty_a < 0.0f) duty_a = 0.0f; else if (duty_a > 1.0f) duty_a = 1.0f;
     if (duty_b < 0.0f) duty_b = 0.0f; else if (duty_b > 1.0f) duty_b = 1.0f;
     if (duty_c < 0.0f) duty_c = 0.0f; else if (duty_c > 1.0f) duty_c = 1.0f;
 
-    // 5. Update MCPWM compare registers
+    // 9. Update MCPWM compare registers
     mcpwm_comparator_set_compare_value(comparators[0], (uint32_t)(duty_a * (float)PWM_MAX_DUTY));
     mcpwm_comparator_set_compare_value(comparators[1], (uint32_t)(duty_b * (float)PWM_MAX_DUTY));
     mcpwm_comparator_set_compare_value(comparators[2], (uint32_t)(duty_c * (float)PWM_MAX_DUTY));
@@ -291,12 +416,262 @@ static void IRAM_ATTR foc_timer_callback(void* arg) {
 }
 
 // =========================================================================
-// 10. MAIN ENTRY POINT
+// 10. INTERACTIVE UART RUNTIME CLI TASK
+// =========================================================================
+static void cli_task(void *pvParameters) {
+    uart_config_t uart_config = {
+        .baud_rate  = 115200,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
+    uart_param_config(UART_NUM_0, &uart_config);
+
+    printf("\r\n");
+    printf("===============================================================\r\n");
+    printf("        ESP32-S3 FOC MOTOR CONTROLLER RUNTIME CLI             \r\n");
+    printf("===============================================================\r\n");
+    printf(" Commands:\r\n");
+    printf("   vq <volts>    - Set torque voltage target (e.g. 'vq 1.5')\r\n");
+    printf("   vd <volts>    - Set flux voltage target   (e.g. 'vd 0.0')\r\n");
+    printf("   limit <amps>  - Set max current limit     (e.g. 'limit 2.0')\r\n");
+    printf("   trip <amps>   - Set emergency trip cutoff (e.g. 'trip 3.0')\r\n");
+    printf("   stop          - Stop motor (set Vq=0, Vd=0)\r\n");
+    printf("   reset         - Clear overcurrent trip and re-enable driver\r\n");
+    printf("   status / ?    - Display live telemetry and parameter state\r\n");
+    printf("===============================================================\r\n\r\n");
+    printf("FOC> ");
+    fflush(stdout);
+
+    char line[128];
+    int pos = 0;
+
+    while (1) {
+        uint8_t ch;
+        int len = uart_read_bytes(UART_NUM_0, &ch, 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            if (ch == '\r' || ch == '\n') {
+                if (pos > 0) {
+                    line[pos] = '\0';
+                    printf("\r\n");
+
+                    char *cmd = line;
+                    while (isspace((unsigned char)*cmd)) cmd++;
+
+                    if (strncmp(cmd, "vq", 2) == 0) {
+                        float val = (float)atof(cmd + 2);
+                        target_Vq = val;
+                        printf("[OK] target_Vq set to %4.2f V\r\n", target_Vq);
+                    } else if (strncmp(cmd, "vd", 2) == 0) {
+                        float val = (float)atof(cmd + 2);
+                        target_Vd = val;
+                        printf("[OK] target_Vd set to %4.2f V\r\n", target_Vd);
+                    } else if (strncmp(cmd, "limit", 5) == 0) {
+                        float val = (float)atof(cmd + 5);
+                        if (val > 0.1f) {
+                            current_limit_amps = val;
+                            printf("[OK] Current limit set to %4.2f A\r\n", current_limit_amps);
+                        } else {
+                            printf("[ERR] Limit must be > 0.1 A\r\n");
+                        }
+                    } else if (strncmp(cmd, "trip", 4) == 0) {
+                        float val = (float)atof(cmd + 4);
+                        if (val > current_limit_amps) {
+                            emergency_trip_amps = val;
+                            printf("[OK] Emergency trip set to %4.2f A\r\n", emergency_trip_amps);
+                        } else {
+                            printf("[ERR] Trip must be greater than current limit (%4.2f A)\r\n", current_limit_amps);
+                        }
+                    } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "s") == 0) {
+                        target_Vq = 0.0f;
+                        target_Vd = 0.0f;
+                        printf("[OK] Motor stopped (Vq=0.0V, Vd=0.0V)\r\n");
+                    } else if (strcmp(cmd, "reset") == 0 || strcmp(cmd, "r") == 0) {
+                        overcurrent_tripped = false;
+                        gpio_set_level(PIN_DRV_EN, 1);
+                        gpio_set_level(PIN_INLA, 1);
+                        gpio_set_level(PIN_INLB, 1);
+                        gpio_set_level(PIN_INLC, 1);
+                        printf("[OK] Trip cleared. Driver re-enabled.\r\n");
+                    } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
+                        int fault = gpio_get_level(PIN_DRV_FAULT);
+                        printf("--- System Status ---\r\n");
+                        printf("  Vq Target:     %4.2f V\r\n", target_Vq);
+                        printf("  Vd Target:     %4.2f V\r\n", target_Vd);
+                        printf("  Angle:         %6.2f deg\r\n", electrical_angle * (180.0f / (float)M_PI));
+                        printf("  Current Limit: %4.2f A\r\n", current_limit_amps);
+                        printf("  Trip Current:  %4.2f A\r\n", emergency_trip_amps);
+                        printf("  Measured I:    %4.2f A (Iq=%4.2f A, Id=%4.2f A)\r\n", measured_I_mag, measured_Iq, measured_Id);
+                        printf("  State:         %s\r\n", overcurrent_tripped ? "TRIPPED (Type 'reset' to clear)" : (fault ? "RUNNING_OK" : "HW_FAULT"));
+                    } else {
+                        printf("[ERR] Unknown command: '%s'. Type 'help' for commands.\r\n", cmd);
+                    }
+                    pos = 0;
+                    printf("FOC> ");
+                    fflush(stdout);
+                }
+            } else if (ch == '\b' || ch == 127) {
+                if (pos > 0) {
+                    pos--;
+                    printf("\b \b");
+                    fflush(stdout);
+                }
+            } else if (pos < (int)(sizeof(line) - 1) && ch >= 32 && ch <= 126) {
+                line[pos++] = (char)ch;
+                putchar(ch);
+                fflush(stdout);
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 11. WEB SERVER & HTTP REST API HANDLERS
+// =========================================================================
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t status_get_handler(httpd_req_t *req) {
+    char resp_str[256];
+    int fault = gpio_get_level(PIN_DRV_FAULT);
+    snprintf(resp_str, sizeof(resp_str),
+             "{\"vq\":%.2f,\"vd\":%.2f,\"current\":%.2f,\"iq\":%.2f,\"id\":%.2f,\"limit\":%.2f,\"trip\":%.2f,\"angle_deg\":%.1f,\"tripped\":%s,\"hw_ok\":%s}",
+             target_Vq, target_Vd, measured_I_mag, measured_Iq, measured_Id,
+             current_limit_amps, emergency_trip_amps,
+             electrical_angle * (180.0f / (float)M_PI),
+             overcurrent_tripped ? "true" : "false",
+             fault ? "true" : "false");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t set_post_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        return httpd_resp_send_500(req);
+    }
+    buf[ret] = '\0';
+
+    char *p = strstr(buf, "\"vq\":");
+    if (p) target_Vq = (float)atof(p + 5);
+
+    p = strstr(buf, "\"vd\":");
+    if (p) target_Vd = (float)atof(p + 5);
+
+    p = strstr(buf, "\"limit\":");
+    if (p) {
+        float l = (float)atof(p + 8);
+        if (l > 0.1f) current_limit_amps = l;
+    }
+
+    p = strstr(buf, "\"trip\":");
+    if (p) {
+        float t = (float)atof(p + 7);
+        if (t > current_limit_amps) emergency_trip_amps = t;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t stop_post_handler(httpd_req_t *req) {
+    target_Vq = 0.0f;
+    target_Vd = 0.0f;
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "{\"status\":\"stopped\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t reset_post_handler(httpd_req_t *req) {
+    overcurrent_tripped = false;
+    gpio_set_level(PIN_DRV_EN, 1);
+    gpio_set_level(PIN_INLA, 1);
+    gpio_set_level(PIN_INLB, 1);
+    gpio_set_level(PIN_INLC, 1);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "{\"status\":\"reset_ok\"}", HTTPD_RESP_USE_STRLEN);
+}
+
+static httpd_handle_t start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 8;
+    config.stack_size = 8192;
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+        httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
+        httpd_uri_t set_uri = { .uri = "/api/set", .method = HTTP_POST, .handler = set_post_handler };
+        httpd_uri_t stop_uri = { .uri = "/api/stop", .method = HTTP_POST, .handler = stop_post_handler };
+        httpd_uri_t reset_uri = { .uri = "/api/reset", .method = HTTP_POST, .handler = reset_post_handler };
+
+        httpd_register_uri_handler(server, &root_uri);
+        httpd_register_uri_handler(server, &status_uri);
+        httpd_register_uri_handler(server, &set_uri);
+        httpd_register_uri_handler(server, &stop_uri);
+        httpd_register_uri_handler(server, &reset_uri);
+        ESP_LOGI(TAG, "HTTP Web Server started successfully.");
+        return server;
+    }
+    ESP_LOGE(TAG, "Failed to start HTTP Web Server.");
+    return NULL;
+}
+
+// =========================================================================
+// 12. WIFI SOFTAP INITIALIZATION
+// =========================================================================
+static void wifi_init_softap(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = { .required = false },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Wi-Fi SoftAP started. SSID: '%s', Password: '%s', IP: 192.168.4.1",
+             WIFI_SSID, WIFI_PASS);
+}
+
+// =========================================================================
+// 13. MAIN ENTRY POINT
 // =========================================================================
 void app_main(void) {
     ESP_LOGI(TAG, "Initializing FOC Motor Controller on ESP32-S3-WROOM-1...");
 
-    // 1. Configure DRV8323 Enable & 3x PWM Low-Side pins (held HIGH in 3x mode)
+    // 1. Initialize NVS Flash (required for Wi-Fi storage)
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+
+    // 2. Configure DRV8323 Enable & 3x PWM Low-Side pins (held HIGH in 3x mode)
     const gpio_config_t out_conf = {
         .pin_bit_mask = (1ULL << PIN_DRV_EN) | (1ULL << PIN_INLA) | (1ULL << PIN_INLB) | (1ULL << PIN_INLC),
         .mode         = GPIO_MODE_OUTPUT,
@@ -322,20 +697,16 @@ void app_main(void) {
     gpio_set_level(PIN_INLC, 1);   // Enable Phase C half-bridge
     vTaskDelay(pdMS_TO_TICKS(15)); // DRV8323 power-on wake delay
 
-    // 2. Initialize Hardware Peripherals
+    // 3. Initialize Hardware Peripherals
     drv_spi_init();
     as5600_i2c_init();
     pwm_init();
     adc_init();
 
-    // 3. Configure DRV8323 Control Register 2 (0x02) for 3x PWM Mode
-    // Bit 6:5 = 01b (3x PWM Mode), Bit 4 = 0 (1x PWM Mode disabled)
-    uint16_t ctrl2 = drv_read_reg(0x02);
-    ctrl2 = (ctrl2 & ~(0x03 << 5)) | (0x01 << 5);
-    drv_write_reg(0x02, ctrl2);
-    ESP_LOGI(TAG, "DRV8323 Control Register 2 set to 3x PWM Mode (0x%04X).", ctrl2);
+    // 4. Configure DRV8323 Hardware Safety Registers (Dead Time, OCP, Slew Rate, CSA, 3x Mode)
+    drv_safety_configure();
 
-    // 4. Start 5 kHz High-Resolution Periodic Timer (200 microseconds)
+    // 5. Start 5 kHz High-Resolution Periodic Timer (200 microseconds)
     target_Vq = 0.0f;
     target_Vd = 0.0f;
 
@@ -348,14 +719,17 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_timer_create(&foc_timer_args, &foc_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(foc_timer, 200));
 
-    ESP_LOGI(TAG, "5 kHz FOC Control Loop running.");
+    // 6. Initialize Wi-Fi SoftAP and Embedded Web Dashboard Server
+    wifi_init_softap();
+    start_webserver();
 
-    // 5. Idle / Status Logging Loop
+    // 7. Launch Interactive UART CLI Task on Core 0
+    xTaskCreatePinnedToCore(cli_task, "cli_task", 4096, NULL, 5, NULL, 0);
+
+    ESP_LOGI(TAG, "5 kHz FOC Loop running. Web Dashboard at http://192.168.4.1. CLI active.");
+
+    // 8. Idle task loop
     while (1) {
-        int fault = gpio_get_level(PIN_DRV_FAULT);
-        ESP_LOGI(TAG, "Status | Angle: %6.2f deg | Vq: %4.2f V | Vd: %4.2f V | Fault: %s",
-                 electrical_angle * (180.0f / (float)M_PI), target_Vq, target_Vd,
-                 fault ? "OK" : "FAULT");
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
