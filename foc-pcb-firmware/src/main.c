@@ -18,13 +18,11 @@
 #include "driver/mcpwm_prelude.h"
 #include "esp_adc/adc_continuous.h"
 #include "web_ui.h"
+#include "wifi_credentials.h"
 
 #define TAG "FOC_DRIVER"
-
-#define WIFI_SSID      "ESP32-FOC-Driver"
-#define WIFI_PASS      "12345678"
-#define WIFI_CHANNEL   1
 #define MAX_STA_CONN   4
+
 
 // =========================================================================
 // 1. PIN DEFINITIONS (ESP32-S3-WROOM-1 N16R8 PINOUT)
@@ -686,34 +684,82 @@ static httpd_handle_t start_webserver(void) {
 }
 
 // =========================================================================
-// 12. WIFI SOFTAP INITIALIZATION
+// 12. WIFI DUAL-MODE (STATION & SOFTAP FALLBACK) INITIALIZATION
 // =========================================================================
-static void wifi_init_softap(void) {
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected. Reconnecting in background...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "==========================================================");
+        ESP_LOGI(TAG, ">>> CONNECTED TO LOCAL WI-FI NETWORK! <<<");
+        ESP_LOGI(TAG, ">>> Web Dashboard: http://" IPSTR " <<<", IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "==========================================================");
+    }
+}
+
+static void wifi_init_network(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_netif_create_default_wifi_sta();
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    wifi_config_t wifi_config = {
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+
+    wifi_config_t sta_config = {
+        .sta = {
+            .ssid = STA_WIFI_SSID,
+            .password = STA_WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = { .capable = true, .required = false },
+        },
+    };
+
+    wifi_config_t ap_config = {
         .ap = {
-            .ssid = WIFI_SSID,
-            .ssid_len = strlen(WIFI_SSID),
-            .channel = WIFI_CHANNEL,
-            .password = WIFI_PASS,
+            .ssid = AP_WIFI_SSID,
+            .ssid_len = strlen(AP_WIFI_SSID),
+            .channel = 1,
+            .password = AP_WIFI_PASS,
             .max_connection = MAX_STA_CONN,
             .authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = { .required = false },
         },
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    bool use_sta = (strlen(STA_WIFI_SSID) > 0 && strcmp(STA_WIFI_SSID, "YOUR_WIFI_SSID") != 0);
 
-    ESP_LOGI(TAG, "Wi-Fi SoftAP started. SSID: '%s', Password: '%s', IP: 192.168.4.1",
-             WIFI_SSID, WIFI_PASS);
+    if (use_sta) {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+        ESP_LOGI(TAG, "Connecting to local Wi-Fi: '%s' (SoftAP '%s' also active as fallback)",
+                 STA_WIFI_SSID, AP_WIFI_SSID);
+    } else {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+        ESP_LOGI(TAG, "Local Wi-Fi credentials not configured. SoftAP active at http://192.168.4.1 (SSID: '%s', Pass: '%s')",
+                 AP_WIFI_SSID, AP_WIFI_PASS);
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
 // =========================================================================
@@ -777,14 +823,14 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_timer_create(&foc_timer_args, &foc_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(foc_timer, 200));
 
-    // 6. Initialize Wi-Fi SoftAP and Embedded Web Dashboard Server
-    wifi_init_softap();
+    // 6. Initialize Wi-Fi Network & Web Dashboard Server
+    wifi_init_network();
     start_webserver();
 
     // 7. Launch Interactive UART CLI Task on Core 0
     xTaskCreatePinnedToCore(cli_task, "cli_task", 4096, NULL, 5, NULL, 0);
 
-    ESP_LOGI(TAG, "5 kHz FOC Loop running. Web Dashboard at http://192.168.4.1. CLI active.");
+    ESP_LOGI(TAG, "5 kHz FOC Loop running. CLI active.");
 
     // 8. Background Idle Loop (Zero overhead when stream is disabled)
     while (1) {

@@ -39,7 +39,9 @@ fp-info-cache
 # Local project settings
 *.kicad_prl
 
-# Firmware Build Artifacts
+# Firmware Build Artifacts & Secret Credentials
 .pio/
 build/
 sdkconfig.old
+*wifi_credentials.h
+*.env
