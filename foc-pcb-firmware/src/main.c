@@ -658,7 +658,12 @@ static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 10;
     config.stack_size = 8192;
+    config.lru_purge_enable = true;
+    config.max_open_sockets = 7;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
     httpd_handle_t server = NULL;
+
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
