@@ -35,11 +35,15 @@ static const char index_html[] = R"rawliteral(
     .badge-trip { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid var(--danger); }
     .badge-warn { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid var(--warning); }
 
-    /* Nav Tabs */
-    .tabs { display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 1px solid var(--card-border); padding-bottom: 8px; }
+    /* Nav Tabs & Stream Control */
+    .nav-bar { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 18px; border-bottom: 1px solid var(--card-border); padding-bottom: 10px; gap: 10px; }
+    .tabs { display: flex; gap: 8px; }
     .tab-btn { background: transparent; color: var(--muted); border: none; padding: 8px 16px; font-size: 0.9rem; font-weight: 600; border-radius: 8px; cursor: pointer; transition: all 0.2s; }
     .tab-btn:hover { color: var(--text); background: rgba(255,255,255,0.05); }
     .tab-btn.active { color: #fff; background: var(--primary); }
+
+    .stream-ctrl { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; }
+    .stream-ctrl select { background: #0f172a; border: 1px solid var(--card-border); color: #f8fafc; padding: 6px 10px; border-radius: 6px; font-size: 0.85rem; outline: none; }
 
     .tab-content { display: none; }
     .tab-content.active { display: block; }
@@ -88,14 +92,12 @@ static const char index_html[] = R"rawliteral(
     .bit-chip { padding: 4px 8px; border-radius: 6px; font-size: 0.75rem; font-family: monospace; font-weight: 600; border: 1px solid #334155; background: #0f172a; color: var(--muted); }
     .bit-chip.active-fault { background: rgba(239, 68, 68, 0.2); color: #f87171; border-color: var(--danger); }
     .bit-chip.active-ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: var(--success); }
-    .bit-chip.active-info { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border-color: var(--primary); }
 
     .field-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 0.85rem; }
     .field-row:last-child { border-bottom: none; }
     .field-name { color: var(--muted); }
     .field-ctrl select { background: #0f172a; border: 1px solid var(--card-border); color: #f8fafc; padding: 6px 10px; border-radius: 6px; font-size: 0.85rem; outline: none; }
     .field-ctrl select:focus { border-color: var(--primary); }
-    .field-val { font-weight: 600; font-family: monospace; color: #60a5fa; }
   </style>
 </head>
 <body>
@@ -103,19 +105,31 @@ static const char index_html[] = R"rawliteral(
     <header>
       <div>
         <h1><span class="dot"></span> ESP32-S3 FOC & DRV8323 Dashboard</h1>
-        <p style="color: var(--muted); font-size: 0.85rem; margin-top: 2px;">240 MHz Dual-Core | 25 kHz MCPWM | 5 kHz FOC Loop | SPI DRV8323S</p>
+        <p style="color: var(--muted); font-size: 0.85rem; margin-top: 2px;">Core 1: Deterministic 5 kHz FOC Loop | Core 0: Control & Web Services</p>
       </div>
       <div id="statusBadge" class="badge badge-ok">System Ready</div>
     </header>
 
-    <!-- Navigation Tabs -->
-    <div class="tabs">
-      <button class="tab-btn active" onclick="showTab('tab-control')">&#127918; Control & Telemetry</button>
-      <button class="tab-btn" onclick="showTab('tab-regs')">&#9881;&#65039; DRV8323 Register Inspector</button>
+    <!-- Navigation & Telemetry Stream Rate Controls -->
+    <div class="nav-bar">
+      <div class="tabs">
+        <button class="tab-btn active" onclick="showTab('tab-control')">&#127918; Control & Parameters</button>
+        <button class="tab-btn" onclick="showTab('tab-regs')">&#9881;&#65039; DRV8323 Register Inspector</button>
+      </div>
+      <div class="stream-ctrl">
+        <button class="btn-preset" style="padding: 6px 10px;" onclick="fetchStatusSnapshot()">&#8635; Refresh Status</button>
+        <span style="color: var(--muted); font-size: 0.8rem;">Telemetry Stream:</span>
+        <select id="sel_stream_rate" onchange="updateStreamRate()">
+          <option value="0" selected>OFF (0% overhead)</option>
+          <option value="1000">1 Hz (Low)</option>
+          <option value="200">5 Hz (Medium)</option>
+          <option value="100">10 Hz (Fast)</option>
+        </select>
+      </div>
     </div>
 
     <!-- ================================================================= -->
-    <!-- TAB 1: CONTROLLER & TELEMETRY -->
+    <!-- TAB 1: CONTROLLER & PARAMETERS -->
     <!-- ================================================================= -->
     <div id="tab-control" class="tab-content active">
       
@@ -144,7 +158,7 @@ static const char index_html[] = R"rawliteral(
         
         <!-- Sliders Card -->
         <div class="card">
-          <h2 style="font-size: 1.05rem; margin-bottom: 16px;">Runtime Control Parameters</h2>
+          <h2 style="font-size: 1.05rem; margin-bottom: 16px;">Critical Control Parameters</h2>
           
           <!-- Vq Slider -->
           <div class="slider-group">
@@ -209,11 +223,10 @@ static const char index_html[] = R"rawliteral(
     <!-- ================================================================= -->
     <div id="tab-regs" class="tab-content">
       
-      <!-- Top Action Bar -->
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
         <div>
-          <h2 style="font-size: 1.15rem; font-weight: 700;">DRV8323 Silicon Register Map (SPI)</h2>
-          <p style="color: var(--muted); font-size: 0.85rem;">Live 11-bit register audit, fault diagnostics, and gate drive parameters.</p>
+          <h2 style="font-size: 1.15rem; font-weight: 700;">DRV8323 Silicon Register Map (On-Demand SPI)</h2>
+          <p style="color: var(--muted); font-size: 0.85rem;">Zero runtime overhead &bull; Registers read/written strictly on user action.</p>
         </div>
         <button class="btn-primary" onclick="readAllRegisters()">&#8635; Read Registers from DRV8323</button>
       </div>
@@ -283,7 +296,7 @@ static const char index_html[] = R"rawliteral(
           <div class="field-row">
             <span class="field-name">Dead Time (DEAD_TIME)</span>
             <div class="field-ctrl">
-              <select id="sel_DEAD_TIME" onchange="updateReg05()">
+              <select id="sel_DEAD_TIME">
                 <option value="0">50 ns</option>
                 <option value="1">100 ns</option>
                 <option value="2" selected>200 ns (Active)</option>
@@ -294,7 +307,7 @@ static const char index_html[] = R"rawliteral(
           <div class="field-row">
             <span class="field-name">VDS OCP Level (VDS_LVL)</span>
             <div class="field-ctrl">
-              <select id="sel_VDS_LVL" onchange="updateReg05()">
+              <select id="sel_VDS_LVL">
                 <option value="0" selected>0.06 V (Most Sensitive)</option>
                 <option value="1">0.07 V</option>
                 <option value="2">0.09 V</option>
@@ -317,7 +330,7 @@ static const char index_html[] = R"rawliteral(
           <div class="field-row">
             <span class="field-name">OCP Shutdown Mode</span>
             <div class="field-ctrl">
-              <select id="sel_OCP_MODE" onchange="updateReg05()">
+              <select id="sel_OCP_MODE">
                 <option value="0" selected>Latched Fault (Safest)</option>
                 <option value="1">Automatic Retry (4ms)</option>
                 <option value="2">Report Only</option>
@@ -328,7 +341,7 @@ static const char index_html[] = R"rawliteral(
           <div class="field-row">
             <span class="field-name">OCP Deglitch Filter</span>
             <div class="field-ctrl">
-              <select id="sel_OCP_DEG" onchange="updateReg05()">
+              <select id="sel_OCP_DEG">
                 <option value="0">1.0 us</option>
                 <option value="1" selected>2.0 us (Standard)</option>
                 <option value="2">4.0 us</option>
@@ -485,6 +498,8 @@ static const char index_html[] = R"rawliteral(
   </div>
 
   <script>
+    let streamTimer = null;
+
     function showTab(tabId) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -492,6 +507,17 @@ static const char index_html[] = R"rawliteral(
       document.getElementById(tabId).classList.add('active');
       if (tabId === 'tab-regs') {
         readAllRegisters();
+      }
+    }
+
+    function updateStreamRate() {
+      if (streamTimer) {
+        clearInterval(streamTimer);
+        streamTimer = null;
+      }
+      const rate = parseInt(document.getElementById('sel_stream_rate').value);
+      if (rate > 0) {
+        streamTimer = setInterval(fetchStatusSnapshot, rate);
       }
     }
 
@@ -552,7 +578,7 @@ static const char index_html[] = R"rawliteral(
     }
 
     function resetDriver() {
-      fetch('/api/reset', { method: 'POST' }).then(() => readAllRegisters()).catch(err => console.error(err));
+      fetch('/api/reset', { method: 'POST' }).then(() => fetchStatusSnapshot()).catch(err => console.error(err));
     }
 
     function drawDial(angleDeg) {
@@ -588,8 +614,7 @@ static const char index_html[] = R"rawliteral(
       ctx.fill();
     }
 
-    // 10 Hz Telemetry Polling Loop
-    setInterval(() => {
+    function fetchStatusSnapshot() {
       fetch('/api/status')
         .then(r => r.json())
         .then(data => {
@@ -618,9 +643,11 @@ static const char index_html[] = R"rawliteral(
           drawDial(data.angle_deg);
         })
         .catch(err => {});
-    }, 100);
+    }
 
     drawDial(0);
+    // Initial one-shot read on page load
+    fetchStatusSnapshot();
 
     // Register Inspector Functions
     function hex4(v) {

@@ -101,6 +101,8 @@ volatile float    measured_I_mag       = 0.0f;  // Total current magnitude (Amps
 volatile float    electrical_angle     = 0.0f;  // Electrical angle [0, 2*PI)
 volatile uint16_t as5600_zero_offset   = 0;     // Calibrated zero angle offset
 volatile bool     overcurrent_tripped  = false; // Latched overcurrent trip flag
+volatile bool     uart_stream_enabled  = false; // Periodic UART telemetry streaming flag (default: OFF for zero overhead)
+
 
 // =========================================================================
 // 4. DRV8323S SPI DRIVER
@@ -441,7 +443,8 @@ static void cli_task(void *pvParameters) {
     printf("   trip <amps>   - Set emergency trip cutoff (e.g. 'trip 3.0')\r\n");
     printf("   stop          - Stop motor (set Vq=0, Vd=0)\r\n");
     printf("   reset         - Clear overcurrent trip and re-enable driver\r\n");
-    printf("   status / ?    - Display live telemetry and parameter state\r\n");
+    printf("   stream on/off - Toggle live serial telemetry stream (default: OFF)\r\n");
+    printf("   status / ?    - Display live telemetry snapshot on-demand\r\n");
     printf("===============================================================\r\n\r\n");
     printf("FOC> ");
     fflush(stdout);
@@ -485,6 +488,16 @@ static void cli_task(void *pvParameters) {
                         } else {
                             printf("[ERR] Trip must be greater than current limit (%4.2f A)\r\n", current_limit_amps);
                         }
+                    } else if (strncmp(cmd, "stream", 6) == 0) {
+                        if (strstr(cmd, "on")) {
+                            uart_stream_enabled = true;
+                            printf("[OK] Serial telemetry streaming enabled (1 Hz).\r\n");
+                        } else if (strstr(cmd, "off")) {
+                            uart_stream_enabled = false;
+                            printf("[OK] Serial telemetry streaming disabled (0%% overhead).\r\n");
+                        } else {
+                            printf("Stream is currently: %s. Use 'stream on' or 'stream off'.\r\n", uart_stream_enabled ? "ON" : "OFF");
+                        }
                     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "s") == 0) {
                         target_Vq = 0.0f;
                         target_Vd = 0.0f;
@@ -506,6 +519,7 @@ static void cli_task(void *pvParameters) {
                         printf("  Trip Current:  %4.2f A\r\n", emergency_trip_amps);
                         printf("  Measured I:    %4.2f A (Iq=%4.2f A, Id=%4.2f A)\r\n", measured_I_mag, measured_Iq, measured_Id);
                         printf("  State:         %s\r\n", overcurrent_tripped ? "TRIPPED (Type 'reset' to clear)" : (fault ? "RUNNING_OK" : "HW_FAULT"));
+                        printf("  Serial Stream: %s\r\n", uart_stream_enabled ? "ON" : "OFF");
                     } else {
                         printf("[ERR] Unknown command: '%s'. Type 'help' for commands.\r\n", cmd);
                     }
@@ -772,8 +786,15 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "5 kHz FOC Loop running. Web Dashboard at http://192.168.4.1. CLI active.");
 
-    // 8. Idle task loop
+    // 8. Background Idle Loop (Zero overhead when stream is disabled)
     while (1) {
+        if (uart_stream_enabled) {
+            int fault = gpio_get_level(PIN_DRV_FAULT);
+            ESP_LOGI(TAG, "Status | Angle: %6.2f deg | Vq: %4.2f V | Current: %4.2f A | Limit: %3.1f A | State: %s",
+                     electrical_angle * (180.0f / (float)M_PI), target_Vq, measured_I_mag,
+                     current_limit_amps,
+                     overcurrent_tripped ? "TRIPPED" : (fault ? "OK" : "HW_FAULT"));
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
