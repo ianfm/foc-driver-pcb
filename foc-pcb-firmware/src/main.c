@@ -602,9 +602,49 @@ static esp_err_t reset_post_handler(httpd_req_t *req) {
     return httpd_resp_send(req, "{\"status\":\"reset_ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t drv_regs_get_handler(httpd_req_t *req) {
+    uint16_t r0 = drv_read_reg(0x00) & 0x7FF;
+    uint16_t r1 = drv_read_reg(0x01) & 0x7FF;
+    uint16_t r2 = drv_read_reg(0x02) & 0x7FF;
+    uint16_t r3 = drv_read_reg(0x03) & 0x7FF;
+    uint16_t r4 = drv_read_reg(0x04) & 0x7FF;
+    uint16_t r5 = drv_read_reg(0x05) & 0x7FF;
+    uint16_t r6 = drv_read_reg(0x06) & 0x7FF;
+
+    char resp_str[256];
+    snprintf(resp_str, sizeof(resp_str),
+             "{\"r0\":%u,\"r1\":%u,\"r2\":%u,\"r3\":%u,\"r4\":%u,\"r5\":%u,\"r6\":%u}",
+             r0, r1, r2, r3, r4, r5, r6);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t drv_write_post_handler(httpd_req_t *req) {
+    char buf[128];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) return httpd_resp_send_500(req);
+    buf[ret] = '\0';
+
+    char *pa = strstr(buf, "\"addr\":");
+    char *pv = strstr(buf, "\"val\":");
+    if (pa && pv) {
+        uint8_t addr = (uint8_t)atoi(pa + 7);
+        uint16_t val = (uint16_t)atoi(pv + 6);
+        if (addr >= 0x02 && addr <= 0x06) {
+            drv_write_reg(addr, val);
+            ESP_LOGI(TAG, "DRV8323 Reg 0x%02X written with 0x%04X via Web Dashboard", addr, val);
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
+}
+
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 10;
     config.stack_size = 8192;
     httpd_handle_t server = NULL;
 
@@ -614,13 +654,17 @@ static httpd_handle_t start_webserver(void) {
         httpd_uri_t set_uri = { .uri = "/api/set", .method = HTTP_POST, .handler = set_post_handler };
         httpd_uri_t stop_uri = { .uri = "/api/stop", .method = HTTP_POST, .handler = stop_post_handler };
         httpd_uri_t reset_uri = { .uri = "/api/reset", .method = HTTP_POST, .handler = reset_post_handler };
+        httpd_uri_t drv_regs_uri = { .uri = "/api/drv_regs", .method = HTTP_GET, .handler = drv_regs_get_handler };
+        httpd_uri_t drv_write_uri = { .uri = "/api/drv_write", .method = HTTP_POST, .handler = drv_write_post_handler };
 
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &set_uri);
         httpd_register_uri_handler(server, &stop_uri);
         httpd_register_uri_handler(server, &reset_uri);
-        ESP_LOGI(TAG, "HTTP Web Server started successfully.");
+        httpd_register_uri_handler(server, &drv_regs_uri);
+        httpd_register_uri_handler(server, &drv_write_uri);
+        ESP_LOGI(TAG, "HTTP Web Server started successfully with DRV8323 Register API.");
         return server;
     }
     ESP_LOGE(TAG, "Failed to start HTTP Web Server.");
