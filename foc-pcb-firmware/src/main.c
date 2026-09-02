@@ -150,33 +150,40 @@ void drv_write_reg(uint8_t addr, uint16_t val) {
     spi_device_polling_transmit(drv_spi, &t);
 }
 
+static bool drv_is_coasting = true;
+
+void drv_set_coast(bool coast) {
+    if (drv_is_coasting == coast) return;
+    drv_is_coasting = coast;
+    uint16_t ctrl_val = (0x01 << 8) | (0x01 << 5); // OTW_REP=1, PWM_MODE=01b (3x PWM)
+    if (coast) {
+        ctrl_val |= (1 << 2); // Set COAST bit (all 6 MOSFET gates Hi-Z / OFF)
+    }
+    drv_write_reg(0x02, ctrl_val);
+}
+
 bool drv_safety_configure(void) {
     ESP_LOGI(TAG, "Configuring DRV8323 hardware safety registers...");
 
     // Reg 0x03: Unlock registers + HS Slew Rate (120mA Source / 240mA Sink)
-    // LOCK=011b (Unlock), IDRIVEP_HS=0100b (120mA), IDRIVEN_HS=0100b (240mA)
     uint16_t hs_val = (0x03 << 8) | (0x04 << 4) | (0x04);
     drv_write_reg(0x03, hs_val);
 
     // Reg 0x04: LS Gate Drive (Latched Fault, 2000ns TDRIVE, 120mA Source / 240mA Sink)
-    // CBC=0 (Latched fault), TDRIVE=10b (2000ns), IDRIVEP_LS=0100b (120mA), IDRIVEN_LS=0100b (240mA)
     uint16_t ls_val = (0x00 << 10) | (0x02 << 8) | (0x04 << 4) | (0x04);
     drv_write_reg(0x04, ls_val);
 
     // Reg 0x05: OCP Control (200ns Dead-Time, Latched Shutdown Mode, 2us Deglitch, 0.06V lowest VDS threshold)
-    // TRETRY=0 (4ms), DEAD_TIME=10b (200ns), OCP_MODE=00b (Latched fault), OCP_DEG=01b (2us), VDS_LVL=0000b (0.06V - maximum sensitivity)
     uint16_t ocp_val = (0x00 << 10) | (0x02 << 8) | (0x00 << 6) | (0x01 << 4) | (0x00);
     drv_write_reg(0x05, ocp_val);
 
     // Reg 0x06: CSA Control (Bidirectional VREF/2 Midpoint Bias, 10 V/V Gain)
-    // CSA_FET=0 (SPx/SNx), VREF_DIV=0 (VREF/2 enabled), CSA_GAIN=01b (10 V/V), DIS_SEN=0
     uint16_t csa_val = (0x00 << 10) | (0x00 << 9) | (0x01 << 6);
     drv_write_reg(0x06, csa_val);
 
-    // Reg 0x02: Driver Control (3x PWM Mode, Enable UVLO & Gate Fault monitoring, Report OTW)
-    // DIS_CPUV=0, DIS_GDF=0, OTW_REP=1, PWM_MODE=001b (3x PWM), COAST=0, BRAKE=0, CLR_FLT=0
-    uint16_t ctrl_val = (0x01 << 8) | (0x01 << 5);
-    drv_write_reg(0x02, ctrl_val);
+    // Reg 0x02: Driver Control (3x PWM Mode, COAST=1 to start with all gates Hi-Z)
+    drv_is_coasting = false; // force write
+    drv_set_coast(true);
 
     // Read back and log all configuration registers
     ESP_LOGI(TAG, "--- DRV8323 Register Audit ---");
@@ -185,7 +192,7 @@ bool drv_safety_configure(void) {
         ESP_LOGI(TAG, "  Reg 0x%02X: Readback = 0x%04X", reg, r);
     }
 
-    ESP_LOGI(TAG, "DRV8323 hardware safety configurations active (Dead Time: 200ns, OCP: Latched Shutdown, IDRIVE: 120mA/240mA).");
+    ESP_LOGI(TAG, "DRV8323 hardware safety configurations active (Dead Time: 200ns, OCP: Latched Shutdown, 3x PWM Mode, Initial State: COAST).");
     return true;
 }
 
@@ -315,12 +322,47 @@ static inline void update_electrical_angle(uint16_t raw_as5600) {
     electrical_angle = theta_e;
 }
 
+static float csa_offset_a = 0.0f;
+static float csa_offset_b = 0.0f;
+static float csa_offset_c = 0.0f;
+static bool csa_calibrated = false;
+
+static void calibrate_csa_offsets(void) {
+    float sum_a = 0.0f, sum_b = 0.0f, sum_c = 0.0f;
+    int count_a = 0, count_b = 0, count_c = 0;
+    uint8_t buf[256];
+    uint32_t ret_num = 0;
+
+    for (int iter = 0; iter < 50; iter++) {
+        esp_err_t ret = adc_continuous_read(adc_handle, buf, sizeof(buf), &ret_num, 10);
+        if (ret == ESP_OK && ret_num > 0) {
+            for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
+                adc_digi_output_data_t *p = (adc_digi_output_data_t*)&buf[i];
+                float v = ((float)p->type2.data / 4095.0f) * 3.3f;
+                if (p->type2.channel == PIN_SOA_ADC_CH) { sum_a += v; count_a++; }
+                else if (p->type2.channel == PIN_SOB_ADC_CH) { sum_b += v; count_b++; }
+                else if (p->type2.channel == PIN_SOC_ADC_CH) { sum_c += v; count_c++; }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    csa_offset_a = (count_a > 0) ? (sum_a / count_a) : 1.65f;
+    csa_offset_b = (count_b > 0) ? (sum_b / count_b) : 1.65f;
+    csa_offset_c = (count_c > 0) ? (sum_c / count_c) : 1.65f;
+    csa_calibrated = true;
+    printf("[CSA] Calibrated Zero-Offsets: A=%.3fV, B=%.3fV, C=%.3fV\r\n",
+           csa_offset_a, csa_offset_b, csa_offset_c);
+    fflush(stdout);
+}
+
 static inline void foc_loop_tick(void) {
     // Check if system is in emergency tripped state
     if (overcurrent_tripped) {
-        mcpwm_comparator_set_compare_value(comparators[0], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
-        mcpwm_comparator_set_compare_value(comparators[1], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
-        mcpwm_comparator_set_compare_value(comparators[2], (uint32_t)(0.5f * (float)PWM_MAX_DUTY));
+        drv_set_coast(true);
+        mcpwm_comparator_set_compare_value(comparators[0], 0);
+        mcpwm_comparator_set_compare_value(comparators[1], 0);
+        mcpwm_comparator_set_compare_value(comparators[2], 0);
         return;
     }
 
@@ -331,27 +373,49 @@ static inline void foc_loop_tick(void) {
     int samples_a = 0, samples_b = 0, samples_c = 0;
 
     esp_err_t ret = adc_continuous_read(adc_handle, result_buf, sizeof(result_buf), &ret_num, 0);
-    if (ret == ESP_OK && ret_num > 0) {
+    if (ret == ESP_OK && ret_num > 0 && csa_calibrated) {
         for (int i = 0; i < ret_num; i += SOC_ADC_DIGI_RESULT_BYTES) {
             adc_digi_output_data_t *p = (adc_digi_output_data_t*)&result_buf[i];
             uint32_t chan = p->type2.channel;
             uint32_t val  = p->type2.data;
             float v_sens = ((float)val / 4095.0f) * 3.3f;
-            float current = (v_sens - CSA_BIAS_VOLTS) / (SHUNT_RESISTANCE_OHMS * CSA_GAIN_V_PER_V);
 
-            if (chan == PIN_SOA_ADC_CH) { ia += current; samples_a++; }
-            else if (chan == PIN_SOB_ADC_CH) { ib += current; samples_b++; }
-            else if (chan == PIN_SOC_ADC_CH) { ic += current; samples_c++; }
+            if (chan == PIN_SOA_ADC_CH) {
+                ia += (v_sens - csa_offset_a) / (SHUNT_RESISTANCE_OHMS * CSA_GAIN_V_PER_V);
+                samples_a++;
+            } else if (chan == PIN_SOB_ADC_CH) {
+                ib += (v_sens - csa_offset_b) / (SHUNT_RESISTANCE_OHMS * CSA_GAIN_V_PER_V);
+                samples_b++;
+            } else if (chan == PIN_SOC_ADC_CH) {
+                ic += (v_sens - csa_offset_c) / (SHUNT_RESISTANCE_OHMS * CSA_GAIN_V_PER_V);
+                samples_c++;
+            }
         }
         if (samples_a > 0) ia /= (float)samples_a;
         if (samples_b > 0) ib /= (float)samples_b;
         if (samples_c > 0) ic /= (float)samples_c;
     }
 
-    // 2. Clarke & Park Transforms for measured current
+    // Calculate trigonometric terms
     float s = sinf(electrical_angle);
     float c = cosf(electrical_angle);
 
+    // If motor is idle (0V commanded), put driver in COAST mode (all gates Hi-Z, 0mA draw)
+    if (fabsf(target_Vq) < 0.01f && fabsf(target_Vd) < 0.01f) {
+        drv_set_coast(true);
+        measured_Id = 0.0f;
+        measured_Iq = 0.0f;
+        measured_I_mag = 0.0f;
+        mcpwm_comparator_set_compare_value(comparators[0], 0);
+        mcpwm_comparator_set_compare_value(comparators[1], 0);
+        mcpwm_comparator_set_compare_value(comparators[2], 0);
+        return;
+    }
+
+    // When torque is commanded, enable bridge
+    drv_set_coast(false);
+
+    // 2. Clarke & Park Transforms for measured current
     float i_alpha = ia;
     float i_beta  = 0.577350269f * (ia + 2.0f * ib); // 1/sqrt(3) = 0.577350269
 
@@ -362,7 +426,8 @@ static inline void foc_loop_tick(void) {
     // 3. HARDWARE PROTECTION: Instant Emergency Current Trip
     if (measured_I_mag > emergency_trip_amps) {
         overcurrent_tripped = true;
-        gpio_set_level(PIN_DRV_EN, 0); // Immediately pull DRV8323 ENABLE LOW (kill gates)
+        drv_set_coast(true);
+        gpio_set_level(PIN_DRV_EN, 0); // Pull DRV8323 ENABLE LOW
         mcpwm_comparator_set_compare_value(comparators[0], 0);
         mcpwm_comparator_set_compare_value(comparators[1], 0);
         mcpwm_comparator_set_compare_value(comparators[2], 0);
@@ -665,7 +730,11 @@ static esp_err_t drv_write_post_handler(httpd_req_t *req) {
     return httpd_resp_send(req, "{\"status\":\"ok\"}", HTTPD_RESP_USE_STRLEN);
 }
 
-static httpd_handle_t start_webserver(void) {
+static httpd_handle_t web_server = NULL;
+
+static void start_webserver(void) {
+    if (web_server != NULL) return;
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 10;
     config.stack_size = 8192;
@@ -673,10 +742,8 @@ static httpd_handle_t start_webserver(void) {
     config.max_open_sockets = 7;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
-    httpd_handle_t server = NULL;
 
-
-    if (httpd_start(&server, &config) == ESP_OK) {
+    if (httpd_start(&web_server, &config) == ESP_OK) {
         httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
         httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
         httpd_uri_t set_uri = { .uri = "/api/set", .method = HTTP_POST, .handler = set_post_handler };
@@ -685,18 +752,19 @@ static httpd_handle_t start_webserver(void) {
         httpd_uri_t drv_regs_uri = { .uri = "/api/drv_regs", .method = HTTP_GET, .handler = drv_regs_get_handler };
         httpd_uri_t drv_write_uri = { .uri = "/api/drv_write", .method = HTTP_POST, .handler = drv_write_post_handler };
 
-        httpd_register_uri_handler(server, &root_uri);
-        httpd_register_uri_handler(server, &status_uri);
-        httpd_register_uri_handler(server, &set_uri);
-        httpd_register_uri_handler(server, &stop_uri);
-        httpd_register_uri_handler(server, &reset_uri);
-        httpd_register_uri_handler(server, &drv_regs_uri);
-        httpd_register_uri_handler(server, &drv_write_uri);
-        ESP_LOGI(TAG, "HTTP Web Server started successfully with DRV8323 Register API.");
-        return server;
+        httpd_register_uri_handler(web_server, &root_uri);
+        httpd_register_uri_handler(web_server, &status_uri);
+        httpd_register_uri_handler(web_server, &set_uri);
+        httpd_register_uri_handler(web_server, &stop_uri);
+        httpd_register_uri_handler(web_server, &reset_uri);
+        httpd_register_uri_handler(web_server, &drv_regs_uri);
+        httpd_register_uri_handler(web_server, &drv_write_uri);
+        printf("[HTTPD] Web Server started and listening on port 80.\r\n");
+        fflush(stdout);
+    } else {
+        printf("[HTTPD ERR] Failed to start HTTP Web Server.\r\n");
+        fflush(stdout);
     }
-    ESP_LOGE(TAG, "Failed to start HTTP Web Server.");
-    return NULL;
 }
 
 // =========================================================================
@@ -720,7 +788,37 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         printf(">>> CONNECTED TO WI-FI: http://" IPSTR " <<<\r\n", IP2STR(&event->ip_info.ip));
         printf("==========================================================\r\n\r\n");
         fflush(stdout);
+        start_webserver();
     }
+}
+
+static void wifi_scan_networks(void) {
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true
+    };
+    esp_wifi_scan_start(&scan_config, true);
+    uint16_t ap_count = 0;
+    esp_wifi_scan_get_ap_num(&ap_count);
+    if (ap_count > 0) {
+        wifi_ap_record_t *ap_records = malloc(ap_count * sizeof(wifi_ap_record_t));
+        if (ap_records) {
+            esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+            printf("\r\n=== VISIBLE WI-FI NETWORKS FOUND (%d) ===\r\n", ap_count);
+            for (int i = 0; i < ap_count && i < 15; i++) {
+                printf(" [%02d] SSID: '%-20s' | RSSI: %3d dBm | Auth: %d | Chan: %d\r\n",
+                       i + 1, (char*)ap_records[i].ssid, ap_records[i].rssi,
+                       ap_records[i].authmode, ap_records[i].primary);
+            }
+            printf("=========================================\r\n\r\n");
+            free(ap_records);
+        }
+    } else {
+        printf("[WIFI] No Wi-Fi networks found in scan!\r\n");
+    }
+    fflush(stdout);
 }
 
 static void wifi_init_network(void) {
@@ -753,9 +851,11 @@ static void wifi_init_network(void) {
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // Disable Wi-Fi power saving for instant HTTP response
+    wifi_scan_networks();
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
 // =========================================================================
@@ -771,7 +871,7 @@ void app_main(void) {
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    // 2. Configure DRV8323 Enable & 3x PWM Low-Side pins (held HIGH in 3x mode)
+    // 2. Configure DRV8323 Enable & 3x PWM Low-Side pins (initially LOW/Disabled)
     const gpio_config_t out_conf = {
         .pin_bit_mask = (1ULL << PIN_DRV_EN) | (1ULL << PIN_INLA) | (1ULL << PIN_INLB) | (1ULL << PIN_INLC),
         .mode         = GPIO_MODE_OUTPUT,
@@ -791,11 +891,10 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&in_conf));
 
-    gpio_set_level(PIN_DRV_EN, 1); // Enable DRV8323
-    gpio_set_level(PIN_INLA, 1);   // Enable Phase A half-bridge
-    gpio_set_level(PIN_INLB, 1);   // Enable Phase B half-bridge
-    gpio_set_level(PIN_INLC, 1);   // Enable Phase C half-bridge
-    vTaskDelay(pdMS_TO_TICKS(15)); // DRV8323 power-on wake delay
+    gpio_set_level(PIN_DRV_EN, 0); // Keep DRV8323 in sleep during peripheral init
+    gpio_set_level(PIN_INLA, 0);   // Keep low
+    gpio_set_level(PIN_INLB, 0);   // Keep low
+    gpio_set_level(PIN_INLC, 0);   // Keep low
 
     // 3. Initialize Hardware Peripherals
     drv_spi_init();
@@ -803,8 +902,18 @@ void app_main(void) {
     pwm_init();
     adc_init();
 
-    // 4. Configure DRV8323 Hardware Safety Registers (Dead Time, OCP, Slew Rate, CSA, 3x Mode)
-    drv_safety_configure();
+    // 4. Wake DRV8323 and configure safety registers (3x Mode + COAST=1 with gates Hi-Z)
+    gpio_set_level(PIN_DRV_EN, 1); // Wake DRV8323
+    vTaskDelay(pdMS_TO_TICKS(5));  // 5ms wake delay for DVDD & charge pump
+    drv_safety_configure();        // Configures Reg 0x02 to 3x Mode + COAST (all gates Hi-Z)
+
+    // 5. Now that 3x Mode is verified over SPI, enable 3x half-bridges
+    gpio_set_level(PIN_INLA, 1);   // Enable Phase A half-bridge (in 3x mode)
+    gpio_set_level(PIN_INLB, 1);   // Enable Phase B half-bridge (in 3x mode)
+    gpio_set_level(PIN_INLC, 1);   // Enable Phase C half-bridge (in 3x mode)
+
+    // 6. Calibrate CSA Zero-Current Offsets with gates in Hi-Z
+    calibrate_csa_offsets();
 
     // 5. Start 5 kHz High-Resolution Periodic Timer (200 microseconds)
     target_Vq = 0.0f;
@@ -819,9 +928,8 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_timer_create(&foc_timer_args, &foc_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(foc_timer, 200));
 
-    // 6. Initialize Wi-Fi Network & Web Dashboard Server
+    // 6. Initialize Wi-Fi Network (Web Dashboard Server starts automatically on IP acquisition)
     wifi_init_network();
-    start_webserver();
 
     // 7. Launch Interactive UART CLI Task on Core 0
     xTaskCreatePinnedToCore(cli_task, "cli_task", 4096, NULL, 5, NULL, 0);
