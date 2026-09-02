@@ -197,6 +197,37 @@ bool drv_safety_configure(void) {
     return true;
 }
 
+static void calibrate_csa_offsets(void); // forward declaration
+
+void drv_hardware_enable(void) {
+    if (motor_enabled) return;
+    ESP_LOGI(TAG, "Waking DRV8323 from hardware sleep...");
+    gpio_set_level(PIN_DRV_EN, 1); // Assert DRV8323 ENABLE line
+    vTaskDelay(pdMS_TO_TICKS(10)); // Allow DVDD regulator & charge pump to stabilize
+    drv_safety_configure();        // Lock in 3x mode, OCP, dead-time, CSA over SPI
+    gpio_set_level(PIN_INLA, 1);   // Enable Phase A half-bridge (in 3x mode)
+    gpio_set_level(PIN_INLB, 1);   // Enable Phase B half-bridge (in 3x mode)
+    gpio_set_level(PIN_INLC, 1);   // Enable Phase C half-bridge (in 3x mode)
+    calibrate_csa_offsets();       // Calibrate zero-current offsets
+    motor_enabled = true;
+    ESP_LOGI(TAG, ">>> DRV8323 HARDWARE ENABLED AND READY <<<");
+}
+
+void drv_hardware_disable(void) {
+    motor_enabled = false;
+    target_Vq = 0.0f;
+    target_Vd = 0.0f;
+    drv_set_coast(true);
+    mcpwm_comparator_set_compare_value(comparators[0], 0);
+    mcpwm_comparator_set_compare_value(comparators[1], 0);
+    mcpwm_comparator_set_compare_value(comparators[2], 0);
+    gpio_set_level(PIN_INLA, 0);
+    gpio_set_level(PIN_INLB, 0);
+    gpio_set_level(PIN_INLC, 0);
+    gpio_set_level(PIN_DRV_EN, 0); // Put DRV8323 into low-power hardware SLEEP mode
+    ESP_LOGI(TAG, ">>> DRV8323 HARDWARE DISABLED (SLEEP MODE) <<<");
+}
+
 // =========================================================================
 // 5. AS5600 I2C DRIVER
 // =========================================================================
@@ -431,8 +462,13 @@ static inline void foc_loop_tick(void) {
     if (measured_I_mag > emergency_trip_amps) {
         overcurrent_tripped = true;
         motor_enabled = false;
+        target_Vq = 0.0f;
+        target_Vd = 0.0f;
         drv_set_coast(true);
-        gpio_set_level(PIN_DRV_EN, 0); // Pull DRV8323 ENABLE LOW
+        gpio_set_level(PIN_INLA, 0);
+        gpio_set_level(PIN_INLB, 0);
+        gpio_set_level(PIN_INLC, 0);
+        gpio_set_level(PIN_DRV_EN, 0); // Immediately put DRV8323 into SLEEP mode
         mcpwm_comparator_set_compare_value(comparators[0], 0);
         mcpwm_comparator_set_compare_value(comparators[1], 0);
         mcpwm_comparator_set_compare_value(comparators[2], 0);
@@ -528,22 +564,19 @@ static void cli_task(void *pvParameters) {
                     while (isspace((unsigned char)*cmd)) cmd++;
 
                     if (strcmp(cmd, "enable") == 0 || strcmp(cmd, "e") == 0) {
-                        motor_enabled = true;
-                        printf("[OK] Motor output ENABLED.\r\n");
+                        drv_hardware_enable();
+                        printf("[OK] DRV8323 woken and Motor output ENABLED.\r\n");
                     } else if (strcmp(cmd, "disable") == 0 || strcmp(cmd, "d") == 0) {
-                        motor_enabled = false;
-                        target_Vq = 0.0f;
-                        target_Vd = 0.0f;
-                        drv_set_coast(true);
-                        printf("[OK] Motor output DISABLED (COAST mode).\r\n");
+                        drv_hardware_disable();
+                        printf("[OK] Motor output DISABLED (DRV8323 in hardware sleep mode).\r\n");
                     } else if (strncmp(cmd, "vq", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vq = val;
-                        printf("[OK] target_Vq set to %4.2f V (Motor State: %s)\r\n", target_Vq, motor_enabled ? "ENABLED" : "DISABLED / COAST");
+                        printf("[OK] target_Vq set to %4.2f V (Motor State: %s)\r\n", target_Vq, motor_enabled ? "ENABLED" : "SLEEP / DISABLED");
                     } else if (strncmp(cmd, "vd", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vd = val;
-                        printf("[OK] target_Vd set to %4.2f V (Motor State: %s)\r\n", target_Vd, motor_enabled ? "ENABLED" : "DISABLED / COAST");
+                        printf("[OK] target_Vd set to %4.2f V (Motor State: %s)\r\n", target_Vd, motor_enabled ? "ENABLED" : "SLEEP / DISABLED");
                     } else if (strncmp(cmd, "limit", 5) == 0) {
                         float val = (float)atof(cmd + 5);
                         if (val > 0.1f) {
@@ -571,20 +604,12 @@ static void cli_task(void *pvParameters) {
                             printf("Stream is currently: %s. Use 'stream on' or 'stream off'.\r\n", uart_stream_enabled ? "ON" : "OFF");
                         }
                     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "s") == 0) {
-                        motor_enabled = false;
-                        target_Vq = 0.0f;
-                        target_Vd = 0.0f;
-                        drv_set_coast(true);
-                        printf("[OK] Motor stopped and DISABLED (Vq=0.0V, Vd=0.0V)\r\n");
+                        drv_hardware_disable();
+                        printf("[OK] Motor stopped and DRV8323 put into hardware SLEEP mode.\r\n");
                     } else if (strcmp(cmd, "reset") == 0 || strcmp(cmd, "r") == 0) {
                         overcurrent_tripped = false;
-                        motor_enabled = false;
-                        gpio_set_level(PIN_DRV_EN, 1);
-                        gpio_set_level(PIN_INLA, 1);
-                        gpio_set_level(PIN_INLB, 1);
-                        gpio_set_level(PIN_INLC, 1);
-                        drv_set_coast(true);
-                        printf("[OK] Trip cleared. Driver re-enabled in safe COAST mode (type 'enable' or set Vq to drive).\r\n");
+                        drv_hardware_disable();
+                        printf("[OK] Trip cleared. DRV8323 in safe SLEEP mode. Type 'enable' to wake driver.\r\n");
                     } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "ip") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
                         int fault = gpio_get_level(PIN_DRV_FAULT);
                         esp_netif_ip_info_t ip_info;
@@ -595,7 +620,7 @@ static void cli_task(void *pvParameters) {
                         } else {
                             printf("  Web Dashboard: http://192.168.4.1 (SoftAP)\r\n");
                         }
-                        printf("  Motor Drive:   %s\r\n", motor_enabled ? "ENABLED (ACTIVE)" : "DISABLED (COASTING / 0A)");
+                        printf("  DRV8323 State: %s\r\n", motor_enabled ? "WAKED & ACTIVE (3x PWM)" : "HARDWARE SLEEP (0A)");
                         printf("  Vq Target:     %4.2f V\r\n", target_Vq);
                         printf("  Vd Target:     %4.2f V\r\n", target_Vd);
                         printf("  Angle:         %6.2f deg\r\n", electrical_angle * (180.0f / (float)M_PI));
@@ -677,12 +702,9 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
     char *p = strstr(buf, "\"enabled\":");
     if (p) {
         if (strstr(p, "true")) {
-            motor_enabled = true;
+            drv_hardware_enable();
         } else if (strstr(p, "false")) {
-            motor_enabled = false;
-            target_Vq = 0.0f;
-            target_Vd = 0.0f;
-            drv_set_coast(true);
+            drv_hardware_disable();
         }
     }
 
@@ -714,10 +736,7 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stop_post_handler(httpd_req_t *req) {
-    motor_enabled = false;
-    target_Vq = 0.0f;
-    target_Vd = 0.0f;
-    drv_set_coast(true);
+    drv_hardware_disable();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, "{\"status\":\"stopped\"}", HTTPD_RESP_USE_STRLEN);
@@ -725,12 +744,7 @@ static esp_err_t stop_post_handler(httpd_req_t *req) {
 
 static esp_err_t reset_post_handler(httpd_req_t *req) {
     overcurrent_tripped = false;
-    motor_enabled = false;
-    gpio_set_level(PIN_DRV_EN, 1);
-    gpio_set_level(PIN_INLA, 1);
-    gpio_set_level(PIN_INLB, 1);
-    gpio_set_level(PIN_INLC, 1);
-    drv_set_coast(true);
+    drv_hardware_disable();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, "{\"status\":\"reset_ok\"}", HTTPD_RESP_USE_STRLEN);
@@ -917,20 +931,10 @@ void app_main(void) {
     pwm_init();
     adc_init();
 
-    // 4. Wake DRV8323 and configure safety registers (3x Mode + COAST=1 with gates Hi-Z)
-    gpio_set_level(PIN_DRV_EN, 1); // Wake DRV8323
-    vTaskDelay(pdMS_TO_TICKS(5));  // 5ms wake delay for DVDD & charge pump
-    drv_safety_configure();        // Configures Reg 0x02 to 3x Mode + COAST (all gates Hi-Z)
+    // Note: DRV8323 remains in hardware SLEEP mode (PIN_DRV_EN=0, INLx=0).
+    // It will only be powered on when the user explicitly issues an 'enable' command.
 
-    // 5. Now that 3x Mode is verified over SPI, enable 3x half-bridges
-    gpio_set_level(PIN_INLA, 1);   // Enable Phase A half-bridge (in 3x mode)
-    gpio_set_level(PIN_INLB, 1);   // Enable Phase B half-bridge (in 3x mode)
-    gpio_set_level(PIN_INLC, 1);   // Enable Phase C half-bridge (in 3x mode)
-
-    // 6. Calibrate CSA Zero-Current Offsets with gates in Hi-Z
-    calibrate_csa_offsets();
-
-    // 5. Start 5 kHz High-Resolution Periodic Timer (200 microseconds)
+    // 4. Start 5 kHz High-Resolution Periodic Timer (200 microseconds)
     target_Vq = 0.0f;
     target_Vd = 0.0f;
 
