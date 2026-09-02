@@ -539,13 +539,11 @@ static void cli_task(void *pvParameters) {
                     } else if (strncmp(cmd, "vq", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vq = val;
-                        if (fabsf(val) > 0.01f) motor_enabled = true;
-                        printf("[OK] target_Vq set to %4.2f V (Motor %s)\r\n", target_Vq, motor_enabled ? "ENABLED" : "COAST");
+                        printf("[OK] target_Vq set to %4.2f V (Motor State: %s)\r\n", target_Vq, motor_enabled ? "ENABLED" : "DISABLED / COAST");
                     } else if (strncmp(cmd, "vd", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vd = val;
-                        if (fabsf(val) > 0.01f) motor_enabled = true;
-                        printf("[OK] target_Vd set to %4.2f V (Motor %s)\r\n", target_Vd, motor_enabled ? "ENABLED" : "COAST");
+                        printf("[OK] target_Vd set to %4.2f V (Motor State: %s)\r\n", target_Vd, motor_enabled ? "ENABLED" : "DISABLED / COAST");
                     } else if (strncmp(cmd, "limit", 5) == 0) {
                         float val = (float)atof(cmd + 5);
                         if (val > 0.1f) {
@@ -691,13 +689,11 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
     p = strstr(buf, "\"vq\":");
     if (p) {
         target_Vq = (float)atof(p + 5);
-        if (fabsf(target_Vq) > 0.01f) motor_enabled = true;
     }
 
     p = strstr(buf, "\"vd\":");
     if (p) {
         target_Vd = (float)atof(p + 5);
-        if (fabsf(target_Vd) > 0.01f) motor_enabled = true;
     }
 
     p = strstr(buf, "\"limit\":");
