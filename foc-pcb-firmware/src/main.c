@@ -419,17 +419,7 @@ static void IRAM_ATTR foc_timer_callback(void* arg) {
 // 10. INTERACTIVE UART RUNTIME CLI TASK
 // =========================================================================
 static void cli_task(void *pvParameters) {
-    uart_config_t uart_config = {
-        .baud_rate  = 115200,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM_0, &uart_config);
-
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Allow USB CDC enumeration
     printf("\r\n");
     printf("===============================================================\r\n");
     printf("        ESP32-S3 FOC MOTOR CONTROLLER RUNTIME CLI             \r\n");
@@ -451,9 +441,8 @@ static void cli_task(void *pvParameters) {
     int pos = 0;
 
     while (1) {
-        uint8_t ch;
-        int len = uart_read_bytes(UART_NUM_0, &ch, 1, pdMS_TO_TICKS(50));
-        if (len > 0) {
+        int ch = getchar();
+        if (ch != EOF && ch >= 0) {
             if (ch == '\r' || ch == '\n') {
                 if (pos > 0) {
                     line[pos] = '\0';
@@ -507,9 +496,16 @@ static void cli_task(void *pvParameters) {
                         gpio_set_level(PIN_INLB, 1);
                         gpio_set_level(PIN_INLC, 1);
                         printf("[OK] Trip cleared. Driver re-enabled.\r\n");
-                    } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
+                    } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "ip") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
                         int fault = gpio_get_level(PIN_DRV_FAULT);
+                        esp_netif_ip_info_t ip_info;
+                        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
                         printf("--- System Status ---\r\n");
+                        if (netif && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+                            printf("  Web Dashboard: http://" IPSTR "\r\n", IP2STR(&ip_info.ip));
+                        } else {
+                            printf("  Web Dashboard: http://192.168.4.1 (SoftAP)\r\n");
+                        }
                         printf("  Vq Target:     %4.2f V\r\n", target_Vq);
                         printf("  Vd Target:     %4.2f V\r\n", target_Vd);
                         printf("  Angle:         %6.2f deg\r\n", electrical_angle * (180.0f / (float)M_PI));
@@ -545,7 +541,22 @@ static void cli_task(void *pvParameters) {
 // =========================================================================
 static esp_err_t root_get_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    
+    size_t total_len = strlen(index_html);
+    size_t sent = 0;
+    while (sent < total_len) {
+        size_t chunk_len = total_len - sent;
+        if (chunk_len > 2048) {
+            chunk_len = 2048;
+        }
+        esp_err_t err = httpd_resp_send_chunk(req, index_html + sent, chunk_len);
+        if (err != ESP_OK) {
+            return err;
+        }
+        sent += chunk_len;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0); // End of chunked stream
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
@@ -704,6 +715,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, ">>> CONNECTED TO LOCAL WI-FI NETWORK! <<<");
         ESP_LOGI(TAG, ">>> Web Dashboard: http://" IPSTR " <<<", IP2STR(&event->ip_info.ip));
         ESP_LOGI(TAG, "==========================================================");
+        printf("\r\n==========================================================\r\n");
+        printf(">>> CONNECTED TO WI-FI: http://" IPSTR " <<<\r\n", IP2STR(&event->ip_info.ip));
+        printf("==========================================================\r\n\r\n");
+        fflush(stdout);
     }
 }
 
@@ -765,6 +780,7 @@ static void wifi_init_network(void) {
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // Disable Wi-Fi power saving for instant HTTP response
 }
 
 // =========================================================================
