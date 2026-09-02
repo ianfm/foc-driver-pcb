@@ -97,10 +97,42 @@ volatile float    measured_Iq          = 0.0f;  // Measured torque current (Amps
 volatile float    measured_Id          = 0.0f;  // Measured flux current (Amps)
 volatile float    measured_I_mag       = 0.0f;  // Total current magnitude (Amps)
 volatile float    electrical_angle     = 0.0f;  // Electrical angle [0, 2*PI)
-volatile uint16_t as5600_zero_offset   = 0;     // Calibrated zero angle offset
-volatile bool     motor_enabled        = false; // Strict motor output enable flag (default: OFF / COAST)
+volatile float    mechanical_angle_deg = 0.0f;  // Mechanical angle [0, 360 deg) for UI dial
+volatile uint16_t last_raw_angle       = 0;     // Raw 12-bit sensor counts (0..4095)
+volatile uint16_t as5600_zero_offset   = 0;     // Calibrated zero angle offset (0..4095)
+volatile bool     encoder_inverted     = false; // Direction inversion flag (default: standard)
+volatile bool     motor_enabled        = false; // Strict motor output enable flag (default: OFF / SLEEP)
 volatile bool     overcurrent_tripped  = false; // Latched overcurrent trip flag
 volatile bool     uart_stream_enabled  = false; // Periodic UART telemetry streaming flag (default: OFF for zero overhead)
+
+static void load_calibration_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open("calib", NVS_READONLY, &nvs) == ESP_OK) {
+        uint16_t offset = 0;
+        if (nvs_get_u16(nvs, "zero_off", &offset) == ESP_OK) {
+            as5600_zero_offset = offset;
+            ESP_LOGI(TAG, "Loaded encoder zero offset: %u counts (%.1f deg)", offset, ((float)offset / 4096.0f) * 360.0f);
+        }
+        uint8_t inv = 0;
+        if (nvs_get_u8(nvs, "inverted", &inv) == ESP_OK) {
+            encoder_inverted = (inv != 0);
+            ESP_LOGI(TAG, "Loaded encoder inverted state: %s", encoder_inverted ? "YES" : "NO");
+        }
+        nvs_close(nvs);
+    }
+}
+
+static void save_calibration_nvs(void) {
+    nvs_handle_t nvs;
+    if (nvs_open("calib", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u16(nvs, "zero_off", as5600_zero_offset);
+        nvs_set_u8(nvs, "inverted", encoder_inverted ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Persisted encoder calibration to NVS: offset=%u counts (%.1f deg), inv=%d",
+                 as5600_zero_offset, ((float)as5600_zero_offset / 4096.0f) * 360.0f, encoder_inverted);
+    }
+}
 
 
 // =========================================================================
@@ -340,10 +372,16 @@ void adc_init(void) {
 // 8. FOC MATHEMATICAL TRANSFORMS & DUTY UPDATE
 // =========================================================================
 static inline void update_electrical_angle(uint16_t raw_as5600) {
-    int32_t aligned_raw = (int32_t)raw_as5600 - as5600_zero_offset;
-    if (aligned_raw < 0) {
+    last_raw_angle = raw_as5600;
+    int32_t raw = encoder_inverted ? (((4096 - (int32_t)raw_as5600) % 4096 + 4096) % 4096) : (int32_t)raw_as5600;
+    int32_t aligned_raw = raw - (int32_t)as5600_zero_offset;
+    while (aligned_raw < 0) {
         aligned_raw += 4096;
     }
+    aligned_raw %= 4096;
+
+    // Mechanical angle [0, 360 deg) for UI dial
+    mechanical_angle_deg = ((float)aligned_raw / 4096.0f) * 360.0f;
 
     // Convert 12-bit sensor counts to mechanical angle [0, 2*PI)
     float mechanical_angle = ((float)aligned_raw / 4096.0f) * (2.0f * (float)M_PI);
@@ -610,6 +648,33 @@ static void cli_task(void *pvParameters) {
                         overcurrent_tripped = false;
                         drv_hardware_disable();
                         printf("[OK] Trip cleared. DRV8323 in safe SLEEP mode. Type 'enable' to wake driver.\r\n");
+                    } else if (strcmp(cmd, "zero") == 0 || strcmp(cmd, "z") == 0) {
+                        int32_t raw = encoder_inverted ? (((4096 - (int32_t)last_raw_angle) % 4096 + 4096) % 4096) : (int32_t)last_raw_angle;
+                        as5600_zero_offset = (uint16_t)(raw % 4096);
+                        save_calibration_nvs();
+                        printf("[OK] Current orientation set as 0.0 deg (Offset: %u counts / %.1f deg).\r\n", as5600_zero_offset, ((float)as5600_zero_offset / 4096.0f) * 360.0f);
+                    } else if (strcmp(cmd, "down") == 0) {
+                        int32_t raw = encoder_inverted ? (((4096 - (int32_t)last_raw_angle) % 4096 + 4096) % 4096) : (int32_t)last_raw_angle;
+                        as5600_zero_offset = (uint16_t)(((raw - 2048) % 4096 + 4096) % 4096);
+                        save_calibration_nvs();
+                        printf("[OK] Current orientation set as 180.0 deg DOWN (Offset: %u counts / %.1f deg).\r\n", as5600_zero_offset, ((float)as5600_zero_offset / 4096.0f) * 360.0f);
+                    } else if (strncmp(cmd, "offset", 6) == 0) {
+                        if (strlen(cmd) > 7) {
+                            float off = (float)atof(cmd + 7);
+                            while (off < 0.0f) off += 360.0f;
+                            while (off >= 360.0f) off -= 360.0f;
+                            as5600_zero_offset = (uint16_t)((off / 360.0f) * 4096.0f) % 4096;
+                            save_calibration_nvs();
+                            printf("[OK] Zero offset set to %5.1f deg (%u counts).\r\n", off, as5600_zero_offset);
+                        } else {
+                            printf("Current Zero Offset: %5.1f deg (%u counts).\r\n", ((float)as5600_zero_offset / 4096.0f) * 360.0f, as5600_zero_offset);
+                        }
+                    } else if (strncmp(cmd, "invert", 6) == 0) {
+                        if (strstr(cmd, "on")) encoder_inverted = true;
+                        else if (strstr(cmd, "off")) encoder_inverted = false;
+                        else encoder_inverted = !encoder_inverted;
+                        save_calibration_nvs();
+                        printf("[OK] Encoder direction inversion: %s\r\n", encoder_inverted ? "ON (Reversed)" : "OFF (Normal)");
                     } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "ip") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
                         int fault = gpio_get_level(PIN_DRV_FAULT);
                         esp_netif_ip_info_t ip_info;
@@ -623,11 +688,13 @@ static void cli_task(void *pvParameters) {
                         printf("  DRV8323 State: %s\r\n", motor_enabled ? "WAKED & ACTIVE (3x PWM)" : "HARDWARE SLEEP (0A)");
                         printf("  Vq Target:     %4.2f V\r\n", target_Vq);
                         printf("  Vd Target:     %4.2f V\r\n", target_Vd);
-                        printf("  Angle:         %6.2f deg\r\n", electrical_angle * (180.0f / (float)M_PI));
+                        printf("  Mech Angle:    %6.1f deg (Dial Angle)\r\n", mechanical_angle_deg);
+                        printf("  Raw Sensor:    %5u counts (Offset: %5.1f deg / %u counts, Inv: %s)\r\n",
+                               last_raw_angle, ((float)as5600_zero_offset / 4096.0f) * 360.0f, as5600_zero_offset, encoder_inverted ? "YES" : "NO");
                         printf("  Current Limit: %4.2f A\r\n", current_limit_amps);
                         printf("  Trip Current:  %4.2f A\r\n", emergency_trip_amps);
-                        printf("  Measured I:    %4.2f A (Iq=%4.2f A, Id=%4.2f A)\r\n", measured_I_mag, measured_Iq, measured_Id);
-                        printf("  State:         %s\r\n", overcurrent_tripped ? "TRIPPED (Type 'reset' to clear)" : (fault ? "RUNNING_OK" : "HW_FAULT"));
+                        bool hw_ok = !motor_enabled || (fault != 0);
+                        printf("  State:         %s\r\n", overcurrent_tripped ? "TRIPPED" : (hw_ok ? "OK" : "HW_FAULT"));
                         printf("  Serial Stream: %s\r\n", uart_stream_enabled ? "ON" : "OFF");
                     } else {
                         printf("[ERR] Unknown command: '%s'. Type 'help' for commands.\r\n", cmd);
@@ -647,6 +714,8 @@ static void cli_task(void *pvParameters) {
                 putchar(ch);
                 fflush(stdout);
             }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10)); // Yield CPU0 to IDLE and HTTP web server
         }
     }
 }
@@ -675,16 +744,24 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t status_get_handler(httpd_req_t *req) {
-    char resp_str[256];
+    char resp_str[320];
     int fault = gpio_get_level(PIN_DRV_FAULT);
+    // When motor is in sleep mode, nFAULT floating low is normal, not a hardware fault.
+    bool hw_ok = !motor_enabled || (fault != 0);
+    float offset_deg = ((float)as5600_zero_offset / 4096.0f) * 360.0f;
+
     snprintf(resp_str, sizeof(resp_str),
-             "{\"enabled\":%s,\"vq\":%.2f,\"vd\":%.2f,\"current\":%.2f,\"iq\":%.2f,\"id\":%.2f,\"limit\":%.2f,\"trip\":%.2f,\"angle_deg\":%.1f,\"tripped\":%s,\"hw_ok\":%s}",
+             "{\"enabled\":%s,\"vq\":%.2f,\"vd\":%.2f,\"current\":%.2f,\"iq\":%.2f,\"id\":%.2f,\"limit\":%.2f,\"trip\":%.2f,\"angle_deg\":%.1f,\"raw_angle\":%u,\"offset_deg\":%.1f,\"offset_counts\":%u,\"inverted\":%s,\"tripped\":%s,\"hw_ok\":%s}",
              motor_enabled ? "true" : "false",
              target_Vq, target_Vd, measured_I_mag, measured_Iq, measured_Id,
              current_limit_amps, emergency_trip_amps,
-             electrical_angle * (180.0f / (float)M_PI),
+             mechanical_angle_deg,
+             last_raw_angle,
+             offset_deg,
+             as5600_zero_offset,
+             encoder_inverted ? "true" : "false",
              overcurrent_tripped ? "true" : "false",
-             fault ? "true" : "false");
+             hw_ok ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -692,7 +769,7 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t set_post_handler(httpd_req_t *req) {
-    char buf[128];
+    char buf[160];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) {
         return httpd_resp_send_500(req);
@@ -728,6 +805,38 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
     if (p) {
         float t = (float)atof(p + 7);
         if (t > current_limit_amps) emergency_trip_amps = t;
+    }
+
+    p = strstr(buf, "\"set_zero\":");
+    if (p) {
+        float target_angle = (float)atof(p + 11);
+        int32_t raw = encoder_inverted ? (((4096 - (int32_t)last_raw_angle) % 4096 + 4096) % 4096) : (int32_t)last_raw_angle;
+        int32_t target_counts = (int32_t)((target_angle / 360.0f) * 4096.0f) % 4096;
+        as5600_zero_offset = (uint16_t)(((raw - target_counts) % 4096 + 4096) % 4096);
+        save_calibration_nvs();
+    }
+
+    p = strstr(buf, "\"offset_deg\":");
+    if (p) {
+        float off = (float)atof(p + 13);
+        while (off < 0.0f) off += 360.0f;
+        while (off >= 360.0f) off -= 360.0f;
+        as5600_zero_offset = (uint16_t)((off / 360.0f) * 4096.0f) % 4096;
+        save_calibration_nvs();
+    }
+
+    p = strstr(buf, "\"offset_counts\":");
+    if (p) {
+        int cnt = atoi(p + 16);
+        while (cnt < 0) cnt += 4096;
+        as5600_zero_offset = (uint16_t)(cnt % 4096);
+        save_calibration_nvs();
+    }
+
+    p = strstr(buf, "\"inverted\":");
+    if (p) {
+        encoder_inverted = (strstr(p, "true") != NULL);
+        save_calibration_nvs();
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -893,12 +1002,13 @@ static void wifi_init_network(void) {
 void app_main(void) {
     ESP_LOGI(TAG, "Initializing FOC Motor Controller on ESP32-S3-WROOM-1...");
 
-    // 1. Initialize NVS Flash (required for Wi-Fi storage)
+    // 1. Initialize NVS Flash (required for Wi-Fi storage and calibration persistence)
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+    load_calibration_nvs(); // Restore calibrated zero offset & inversion from flash
 
     // 2. Configure DRV8323 Enable & 3x PWM Low-Side pins (initially LOW/Disabled)
     const gpio_config_t out_conf = {

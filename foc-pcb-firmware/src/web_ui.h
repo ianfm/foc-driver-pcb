@@ -120,10 +120,10 @@ static const char index_html[] = R"rawliteral(
         <button class="btn-preset" style="padding: 6px 10px;" onclick="fetchStatusSnapshot()">&#8635; Refresh Status</button>
         <span style="color: var(--muted); font-size: 0.8rem;">Telemetry Stream:</span>
         <select id="sel_stream_rate" onchange="updateStreamRate()">
-          <option value="0" selected>OFF (0% overhead)</option>
+          <option value="0">OFF (0% overhead)</option>
           <option value="1000">1 Hz (Low)</option>
           <option value="200">5 Hz (Medium)</option>
-          <option value="100">10 Hz (Fast)</option>
+          <option value="100" selected>10 Hz (Live Tracking)</option>
         </select>
       </div>
     </div>
@@ -206,7 +206,7 @@ static const char index_html[] = R"rawliteral(
         <div class="card" style="display: flex; flex-direction: column; justify-content: space-between;">
           <div class="dial-container">
             <canvas id="angleCanvas" width="160" height="160"></canvas>
-            <div style="font-size: 0.8rem; color: var(--muted); margin-top: 6px;">Live Rotor Angle</div>
+            <div style="font-size: 0.8rem; color: var(--muted); margin-top: 6px;">Live Rotor Angle (Mechanical)</div>
           </div>
           <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
             <button id="btnToggleEnable" class="btn-primary" style="padding: 12px; font-weight: 700; font-size: 0.95rem;" onclick="toggleMotorEnable()">&#9654; ENABLE MOTOR</button>
@@ -215,6 +215,38 @@ static const char index_html[] = R"rawliteral(
           </div>
         </div>
 
+      </div>
+
+      <!-- Encoder Calibration & Standing Offset Card -->
+      <div class="card" style="margin-top: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <h2 style="font-size: 1.05rem; font-weight: 700;">Encoder Alignment & Standing Offset</h2>
+          <span style="font-size: 0.8rem; color: var(--muted);">Raw: <span id="lblRawCounts" style="color: var(--primary); font-weight: 600;">0</span> counts</span>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-bottom: 14px;">
+          <button class="btn-preset" style="padding: 10px; font-weight: 600;" onclick="setZeroOrientation(0)">&#127919; Set Current as 0&deg; (UP)</button>
+          <button class="btn-preset" style="padding: 10px; font-weight: 600;" onclick="setZeroOrientation(180)">&#11015;&#65039; Set Current as 180&deg; (DOWN)</button>
+          <button class="btn-preset" style="padding: 10px; font-weight: 600;" onclick="setZeroOrientation(90)">&#10145;&#65039; Set Current as 90&deg; (RIGHT)</button>
+          <button class="btn-preset" style="padding: 10px; font-weight: 600;" onclick="setZeroOrientation(270)">&#11013;&#65039; Set Current as 270&deg; (LEFT)</button>
+        </div>
+
+        <!-- Fine Tuning Offset Slider -->
+        <div class="slider-group" style="margin-bottom: 8px;">
+          <div class="slider-header">
+            <span>Standing Offset Fine Tuning</span>
+            <span class="slider-val"><span id="lblOffsetDeg">0.0</span>&deg; (<span id="lblOffsetCounts">0</span> counts)</span>
+          </div>
+          <input type="range" id="rngOffset" min="0.0" max="359.9" step="0.5" value="0.0">
+        </div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 0.85rem;">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text);">
+            <input type="checkbox" id="chkInvert" onchange="toggleInvert(this.checked)" style="cursor: pointer;">
+            <span>Reverse Rotation Direction (CW / CCW)</span>
+          </label>
+          <button class="btn-preset" style="padding: 4px 8px; font-size: 0.75rem;" onclick="resetOffset()">Reset to Raw 0&deg;</button>
+        </div>
       </div>
 
     </div>
@@ -600,42 +632,116 @@ static const char index_html[] = R"rawliteral(
       const h = canvas.height;
       const cx = w / 2;
       const cy = h / 2;
-      const r = w / 2 - 12;
+      const r = w / 2 - 16;
 
       ctx.clearRect(0, 0, w, h);
 
+      // Outer track ring
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#1e293b';
+      ctx.lineWidth = 10;
       ctx.stroke();
 
-      const rad = (angleDeg - 90) * (Math.PI / 180.0);
-      const px = cx + (r - 10) * Math.cos(rad);
-      const py = cy + (r - 10) * Math.sin(rad);
+      // Cardinal tick labels (0° UP, 90° RIGHT, 180° DOWN, 270° LEFT)
+      ctx.fillStyle = '#64748b';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
 
+      ctx.fillText('0°', cx, cy - r + 9);
+      ctx.fillText('180°', cx, cy + r - 9);
+      ctx.fillText('90°', cx + r - 10, cy);
+      ctx.fillText('270°', cx - r + 10, cy);
+
+      // Needle pointer calculation
+      const rad = (angleDeg - 90) * (Math.PI / 180.0);
+      const nx = cx + (r - 12) * Math.cos(rad);
+      const ny = cy + (r - 12) * Math.sin(rad);
+
+      // Tail counterweight
+      const tx = cx - 12 * Math.cos(rad);
+      const ty = cy - 12 * Math.sin(rad);
+
+      // Draw needle line
       ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(px, py);
-      ctx.strokeStyle = '#3b82f6';
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(nx, ny);
+      ctx.strokeStyle = '#38bdf8';
       ctx.lineWidth = 4;
       ctx.lineCap = 'round';
       ctx.stroke();
 
+      // Needle pointer dot
+      ctx.beginPath();
+      ctx.arc(nx, ny, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = '#38bdf8';
+      ctx.fill();
+
+      // Center pivot hub
       ctx.beginPath();
       ctx.arc(cx, cy, 6, 0, 2 * Math.PI);
       ctx.fillStyle = '#f8fafc';
       ctx.fill();
     }
 
+    let isFetching = false;
+    let isOffsetSliding = false;
+    const rngOffset = document.getElementById('rngOffset');
+
+    if (rngOffset) {
+      rngOffset.addEventListener('input', (e) => {
+        document.getElementById('lblOffsetDeg').innerText = parseFloat(e.target.value).toFixed(1);
+        isOffsetSliding = true;
+      });
+      rngOffset.addEventListener('change', (e) => {
+        sendParams({ offset_deg: parseFloat(e.target.value) });
+        isOffsetSliding = false;
+      });
+    }
+
+    function setZeroOrientation(targetAngle) {
+      sendParams({ set_zero: targetAngle });
+      setTimeout(fetchStatusSnapshot, 60);
+    }
+
+    function resetOffset() {
+      sendParams({ offset_counts: 0 });
+      setTimeout(fetchStatusSnapshot, 60);
+    }
+
+    function toggleInvert(inverted) {
+      sendParams({ inverted: inverted });
+      setTimeout(fetchStatusSnapshot, 60);
+    }
+
     function fetchStatusSnapshot() {
+      if (isFetching) return;
+      isFetching = true;
       fetch('/api/status')
         .then(r => r.json())
         .then(data => {
+          isFetching = false;
           document.getElementById('txtCurrent').innerText = data.current.toFixed(2);
           document.getElementById('txtVq').innerText = data.vq.toFixed(2);
           document.getElementById('txtLimit').innerText = data.limit.toFixed(2);
           document.getElementById('txtAngle').innerText = data.angle_deg.toFixed(1);
+
+          if (document.getElementById('lblRawCounts')) {
+            document.getElementById('lblRawCounts').innerText = data.raw_angle;
+          }
+          if (document.getElementById('lblOffsetDeg')) {
+            document.getElementById('lblOffsetDeg').innerText = data.offset_deg.toFixed(1);
+          }
+          if (document.getElementById('lblOffsetCounts')) {
+            document.getElementById('lblOffsetCounts').innerText = data.offset_counts;
+          }
+          if (rngOffset && !isOffsetSliding) {
+            rngOffset.value = data.offset_deg;
+          }
+          if (document.getElementById('chkInvert')) {
+            document.getElementById('chkInvert').checked = !!data.inverted;
+          }
 
           motorEnabled = !!data.enabled;
           const btnEnable = document.getElementById('btnToggleEnable');
@@ -658,24 +764,27 @@ static const char index_html[] = R"rawliteral(
           if (data.tripped) {
             badge.innerText = 'TRIPPED (OVERCURRENT)';
             badge.className = 'badge badge-trip';
-          } else if (!data.hw_ok) {
+          } else if (motorEnabled && !data.hw_ok) {
             badge.innerText = 'HARDWARE FAULT';
             badge.className = 'badge badge-trip';
           } else if (motorEnabled) {
             badge.innerText = 'ACTIVE (RUNNING)';
             badge.className = 'badge badge-ok';
           } else {
-            badge.innerText = 'SAFE (COASTING / 0A)';
+            badge.innerText = 'STANDBY (MOTOR UNPOWERED / 0A)';
             badge.className = 'badge badge-warn';
           }
 
           drawDial(data.angle_deg);
         })
-        .catch(err => {});
+        .catch(err => {
+          isFetching = false;
+        });
     }
 
     drawDial(0);
-    // Initial one-shot read on page load
+    // Start continuous 10 Hz telemetry stream on page load
+    updateStreamRate();
     fetchStatusSnapshot();
 
     // Register Inspector Functions
