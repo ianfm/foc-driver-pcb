@@ -208,9 +208,10 @@ static const char index_html[] = R"rawliteral(
             <canvas id="angleCanvas" width="160" height="160"></canvas>
             <div style="font-size: 0.8rem; color: var(--muted); margin-top: 6px;">Live Rotor Angle</div>
           </div>
-          <div style="margin-top: 16px;">
-            <button class="btn-danger" onclick="emergencyStop()">&#9888; EMERGENCY STOP</button>
-            <button class="btn-success" onclick="resetDriver()">&#8635; Clear Trip & Re-Enable</button>
+          <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 8px;">
+            <button id="btnToggleEnable" class="btn-primary" style="padding: 12px; font-weight: 700; font-size: 0.95rem;" onclick="toggleMotorEnable()">&#9654; ENABLE MOTOR</button>
+            <button class="btn-danger" style="padding: 10px; font-weight: 600;" onclick="emergencyStop()">&#9888; EMERGENCY STOP (COAST)</button>
+            <button class="btn-success" style="padding: 8px; font-weight: 600;" onclick="resetDriver()">&#8635; Clear Trip & Reset</button>
           </div>
         </div>
 
@@ -572,12 +573,25 @@ static const char index_html[] = R"rawliteral(
       }).catch(err => console.error(err));
     }
 
+    let motorEnabled = false;
+
+    function toggleMotorEnable() {
+      motorEnabled = !motorEnabled;
+      fetch('/api/set', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: motorEnabled })
+      }).then(() => fetchStatusSnapshot()).catch(err => console.error(err));
+    }
+
     function emergencyStop() {
+      motorEnabled = false;
       setVq(0.0);
-      fetch('/api/stop', { method: 'POST' }).catch(err => console.error(err));
+      fetch('/api/stop', { method: 'POST' }).then(() => fetchStatusSnapshot()).catch(err => console.error(err));
     }
 
     function resetDriver() {
+      motorEnabled = false;
       fetch('/api/reset', { method: 'POST' }).then(() => fetchStatusSnapshot()).catch(err => console.error(err));
     }
 
@@ -623,6 +637,18 @@ static const char index_html[] = R"rawliteral(
           document.getElementById('txtLimit').innerText = data.limit.toFixed(2);
           document.getElementById('txtAngle').innerText = data.angle_deg.toFixed(1);
 
+          motorEnabled = !!data.enabled;
+          const btnEnable = document.getElementById('btnToggleEnable');
+          if (btnEnable) {
+            if (motorEnabled) {
+              btnEnable.innerHTML = '&#10074;&#10074; DISABLE MOTOR (COAST)';
+              btnEnable.style.background = 'var(--warning)';
+            } else {
+              btnEnable.innerHTML = '&#9654; ENABLE MOTOR';
+              btnEnable.style.background = 'var(--primary)';
+            }
+          }
+
           if (!isUserSliding) {
             rngVq.value = data.vq;
             document.getElementById('lblVq').innerText = data.vq.toFixed(2);
@@ -630,14 +656,17 @@ static const char index_html[] = R"rawliteral(
 
           const badge = document.getElementById('statusBadge');
           if (data.tripped) {
-            badge.innerText = 'TRIPPED';
+            badge.innerText = 'TRIPPED (OVERCURRENT)';
             badge.className = 'badge badge-trip';
           } else if (!data.hw_ok) {
             badge.innerText = 'HARDWARE FAULT';
             badge.className = 'badge badge-trip';
-          } else {
-            badge.innerText = 'RUNNING OK';
+          } else if (motorEnabled) {
+            badge.innerText = 'ACTIVE (RUNNING)';
             badge.className = 'badge badge-ok';
+          } else {
+            badge.innerText = 'SAFE (COASTING / 0A)';
+            badge.className = 'badge badge-warn';
           }
 
           drawDial(data.angle_deg);

@@ -98,6 +98,7 @@ volatile float    measured_Id          = 0.0f;  // Measured flux current (Amps)
 volatile float    measured_I_mag       = 0.0f;  // Total current magnitude (Amps)
 volatile float    electrical_angle     = 0.0f;  // Electrical angle [0, 2*PI)
 volatile uint16_t as5600_zero_offset   = 0;     // Calibrated zero angle offset
+volatile bool     motor_enabled        = false; // Strict motor output enable flag (default: OFF / COAST)
 volatile bool     overcurrent_tripped  = false; // Latched overcurrent trip flag
 volatile bool     uart_stream_enabled  = false; // Periodic UART telemetry streaming flag (default: OFF for zero overhead)
 
@@ -259,17 +260,20 @@ void pwm_init(void) {
         mcpwm_generator_config_t g_cfg = { .gen_gpio_num = pwm_pins[i] };
         ESP_ERROR_CHECK(mcpwm_new_generator(oper, &g_cfg, &gen));
 
-        // Center-aligned PWM actions
+        // Center-aligned PWM actions:
+        // UP count at compare match: pull HIGH
+        // DOWN count at compare match: pull LOW
+        // At compare_value = 0: Output is flat 0V (0% duty cycle)
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
-            gen, MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_LOW)));
+            gen, MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, comparators[i], MCPWM_GEN_ACTION_HIGH)));
         ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
-            gen, MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparators[i], MCPWM_GEN_ACTION_HIGH)));
+            gen, MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_DOWN, comparators[i], MCPWM_GEN_ACTION_LOW)));
     }
 
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
-    ESP_LOGI(TAG, "MCPWM initialized: 25 kHz center-aligned (Resolution: %d MHz, Max Duty: %d ticks).",
-             (int)(MCPWM_TIMER_RES_HZ / 1000000), (int)PWM_MAX_DUTY);
+    ESP_LOGI(TAG, "MCPWM initialized: 25 kHz center-aligned (Active HIGH, Max Duty: %d ticks).",
+             (int)PWM_MAX_DUTY);
 }
 
 // =========================================================================
@@ -400,8 +404,8 @@ static inline void foc_loop_tick(void) {
     float s = sinf(electrical_angle);
     float c = cosf(electrical_angle);
 
-    // If motor is idle (0V commanded), put driver in COAST mode (all gates Hi-Z, 0mA draw)
-    if (fabsf(target_Vq) < 0.01f && fabsf(target_Vd) < 0.01f) {
+    // Check if motor is disabled, tripped, or commanded at zero torque
+    if (!motor_enabled || overcurrent_tripped || (fabsf(target_Vq) < 0.01f && fabsf(target_Vd) < 0.01f)) {
         drv_set_coast(true);
         measured_Id = 0.0f;
         measured_Iq = 0.0f;
@@ -412,7 +416,7 @@ static inline void foc_loop_tick(void) {
         return;
     }
 
-    // When torque is commanded, enable bridge
+    // Active modulation requested
     drv_set_coast(false);
 
     // 2. Clarke & Park Transforms for measured current
@@ -426,6 +430,7 @@ static inline void foc_loop_tick(void) {
     // 3. HARDWARE PROTECTION: Instant Emergency Current Trip
     if (measured_I_mag > emergency_trip_amps) {
         overcurrent_tripped = true;
+        motor_enabled = false;
         drv_set_coast(true);
         gpio_set_level(PIN_DRV_EN, 0); // Pull DRV8323 ENABLE LOW
         mcpwm_comparator_set_compare_value(comparators[0], 0);
@@ -470,14 +475,20 @@ static inline void foc_loop_tick(void) {
 }
 
 // =========================================================================
-// 9. 5 kHz (200 µs) TIMER CALLBACK
+// 9. ENCODER SAMPLING TASK & 5 kHz TIMER CALLBACK
 // =========================================================================
-static void IRAM_ATTR foc_timer_callback(void* arg) {
-    int16_t raw_angle = read_as5600();
-    if (raw_angle >= 0) {
-        update_electrical_angle((uint16_t)raw_angle);
-        foc_loop_tick();
+static void encoder_task(void *pvParameters) {
+    while (1) {
+        int16_t raw_angle = read_as5600();
+        if (raw_angle >= 0) {
+            update_electrical_angle((uint16_t)raw_angle);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1)); // 1 kHz angle tracking
     }
+}
+
+static void IRAM_ATTR foc_timer_callback(void* arg) {
+    foc_loop_tick();
 }
 
 // =========================================================================
@@ -516,14 +527,25 @@ static void cli_task(void *pvParameters) {
                     char *cmd = line;
                     while (isspace((unsigned char)*cmd)) cmd++;
 
-                    if (strncmp(cmd, "vq", 2) == 0) {
+                    if (strcmp(cmd, "enable") == 0 || strcmp(cmd, "e") == 0) {
+                        motor_enabled = true;
+                        printf("[OK] Motor output ENABLED.\r\n");
+                    } else if (strcmp(cmd, "disable") == 0 || strcmp(cmd, "d") == 0) {
+                        motor_enabled = false;
+                        target_Vq = 0.0f;
+                        target_Vd = 0.0f;
+                        drv_set_coast(true);
+                        printf("[OK] Motor output DISABLED (COAST mode).\r\n");
+                    } else if (strncmp(cmd, "vq", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vq = val;
-                        printf("[OK] target_Vq set to %4.2f V\r\n", target_Vq);
+                        if (fabsf(val) > 0.01f) motor_enabled = true;
+                        printf("[OK] target_Vq set to %4.2f V (Motor %s)\r\n", target_Vq, motor_enabled ? "ENABLED" : "COAST");
                     } else if (strncmp(cmd, "vd", 2) == 0) {
                         float val = (float)atof(cmd + 2);
                         target_Vd = val;
-                        printf("[OK] target_Vd set to %4.2f V\r\n", target_Vd);
+                        if (fabsf(val) > 0.01f) motor_enabled = true;
+                        printf("[OK] target_Vd set to %4.2f V (Motor %s)\r\n", target_Vd, motor_enabled ? "ENABLED" : "COAST");
                     } else if (strncmp(cmd, "limit", 5) == 0) {
                         float val = (float)atof(cmd + 5);
                         if (val > 0.1f) {
@@ -551,16 +573,20 @@ static void cli_task(void *pvParameters) {
                             printf("Stream is currently: %s. Use 'stream on' or 'stream off'.\r\n", uart_stream_enabled ? "ON" : "OFF");
                         }
                     } else if (strcmp(cmd, "stop") == 0 || strcmp(cmd, "s") == 0) {
+                        motor_enabled = false;
                         target_Vq = 0.0f;
                         target_Vd = 0.0f;
-                        printf("[OK] Motor stopped (Vq=0.0V, Vd=0.0V)\r\n");
+                        drv_set_coast(true);
+                        printf("[OK] Motor stopped and DISABLED (Vq=0.0V, Vd=0.0V)\r\n");
                     } else if (strcmp(cmd, "reset") == 0 || strcmp(cmd, "r") == 0) {
                         overcurrent_tripped = false;
+                        motor_enabled = false;
                         gpio_set_level(PIN_DRV_EN, 1);
                         gpio_set_level(PIN_INLA, 1);
                         gpio_set_level(PIN_INLB, 1);
                         gpio_set_level(PIN_INLC, 1);
-                        printf("[OK] Trip cleared. Driver re-enabled.\r\n");
+                        drv_set_coast(true);
+                        printf("[OK] Trip cleared. Driver re-enabled in safe COAST mode (type 'enable' or set Vq to drive).\r\n");
                     } else if (strcmp(cmd, "status") == 0 || strcmp(cmd, "ip") == 0 || strcmp(cmd, "?") == 0 || strcmp(cmd, "help") == 0) {
                         int fault = gpio_get_level(PIN_DRV_FAULT);
                         esp_netif_ip_info_t ip_info;
@@ -571,6 +597,7 @@ static void cli_task(void *pvParameters) {
                         } else {
                             printf("  Web Dashboard: http://192.168.4.1 (SoftAP)\r\n");
                         }
+                        printf("  Motor Drive:   %s\r\n", motor_enabled ? "ENABLED (ACTIVE)" : "DISABLED (COASTING / 0A)");
                         printf("  Vq Target:     %4.2f V\r\n", target_Vq);
                         printf("  Vd Target:     %4.2f V\r\n", target_Vd);
                         printf("  Angle:         %6.2f deg\r\n", electrical_angle * (180.0f / (float)M_PI));
@@ -628,7 +655,8 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
     char resp_str[256];
     int fault = gpio_get_level(PIN_DRV_FAULT);
     snprintf(resp_str, sizeof(resp_str),
-             "{\"vq\":%.2f,\"vd\":%.2f,\"current\":%.2f,\"iq\":%.2f,\"id\":%.2f,\"limit\":%.2f,\"trip\":%.2f,\"angle_deg\":%.1f,\"tripped\":%s,\"hw_ok\":%s}",
+             "{\"enabled\":%s,\"vq\":%.2f,\"vd\":%.2f,\"current\":%.2f,\"iq\":%.2f,\"id\":%.2f,\"limit\":%.2f,\"trip\":%.2f,\"angle_deg\":%.1f,\"tripped\":%s,\"hw_ok\":%s}",
+             motor_enabled ? "true" : "false",
              target_Vq, target_Vd, measured_I_mag, measured_Iq, measured_Id,
              current_limit_amps, emergency_trip_amps,
              electrical_angle * (180.0f / (float)M_PI),
@@ -648,11 +676,29 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
     }
     buf[ret] = '\0';
 
-    char *p = strstr(buf, "\"vq\":");
-    if (p) target_Vq = (float)atof(p + 5);
+    char *p = strstr(buf, "\"enabled\":");
+    if (p) {
+        if (strstr(p, "true")) {
+            motor_enabled = true;
+        } else if (strstr(p, "false")) {
+            motor_enabled = false;
+            target_Vq = 0.0f;
+            target_Vd = 0.0f;
+            drv_set_coast(true);
+        }
+    }
+
+    p = strstr(buf, "\"vq\":");
+    if (p) {
+        target_Vq = (float)atof(p + 5);
+        if (fabsf(target_Vq) > 0.01f) motor_enabled = true;
+    }
 
     p = strstr(buf, "\"vd\":");
-    if (p) target_Vd = (float)atof(p + 5);
+    if (p) {
+        target_Vd = (float)atof(p + 5);
+        if (fabsf(target_Vd) > 0.01f) motor_enabled = true;
+    }
 
     p = strstr(buf, "\"limit\":");
     if (p) {
@@ -672,8 +718,10 @@ static esp_err_t set_post_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stop_post_handler(httpd_req_t *req) {
+    motor_enabled = false;
     target_Vq = 0.0f;
     target_Vd = 0.0f;
+    drv_set_coast(true);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, "{\"status\":\"stopped\"}", HTTPD_RESP_USE_STRLEN);
@@ -681,10 +729,12 @@ static esp_err_t stop_post_handler(httpd_req_t *req) {
 
 static esp_err_t reset_post_handler(httpd_req_t *req) {
     overcurrent_tripped = false;
+    motor_enabled = false;
     gpio_set_level(PIN_DRV_EN, 1);
     gpio_set_level(PIN_INLA, 1);
     gpio_set_level(PIN_INLB, 1);
     gpio_set_level(PIN_INLC, 1);
+    drv_set_coast(true);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, "{\"status\":\"reset_ok\"}", HTTPD_RESP_USE_STRLEN);
@@ -792,35 +842,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-static void wifi_scan_networks(void) {
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true
-    };
-    esp_wifi_scan_start(&scan_config, true);
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count > 0) {
-        wifi_ap_record_t *ap_records = malloc(ap_count * sizeof(wifi_ap_record_t));
-        if (ap_records) {
-            esp_wifi_scan_get_ap_records(&ap_count, ap_records);
-            printf("\r\n=== VISIBLE WI-FI NETWORKS FOUND (%d) ===\r\n", ap_count);
-            for (int i = 0; i < ap_count && i < 15; i++) {
-                printf(" [%02d] SSID: '%-20s' | RSSI: %3d dBm | Auth: %d | Chan: %d\r\n",
-                       i + 1, (char*)ap_records[i].ssid, ap_records[i].rssi,
-                       ap_records[i].authmode, ap_records[i].primary);
-            }
-            printf("=========================================\r\n\r\n");
-            free(ap_records);
-        }
-    } else {
-        printf("[WIFI] No Wi-Fi networks found in scan!\r\n");
-    }
-    fflush(stdout);
-}
-
 static void wifi_init_network(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -851,11 +872,9 @@ static void wifi_init_network(void) {
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // Disable Wi-Fi power saving for instant HTTP response
-    wifi_scan_networks();
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
-    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
 // =========================================================================
@@ -931,10 +950,13 @@ void app_main(void) {
     // 6. Initialize Wi-Fi Network (Web Dashboard Server starts automatically on IP acquisition)
     wifi_init_network();
 
-    // 7. Launch Interactive UART CLI Task on Core 0
+    // 7. Launch AS5600 Magnetic Encoder Polling Task on Core 1
+    xTaskCreatePinnedToCore(encoder_task, "encoder_task", 4096, NULL, 6, NULL, 1);
+
+    // 8. Launch Interactive UART CLI Task on Core 0
     xTaskCreatePinnedToCore(cli_task, "cli_task", 4096, NULL, 5, NULL, 0);
 
-    ESP_LOGI(TAG, "5 kHz FOC Loop running. CLI active.");
+    ESP_LOGI(TAG, "5 kHz FOC Loop and 1 kHz Encoder tracking running. CLI active.");
 
     // 8. Background Idle Loop (Zero overhead when stream is disabled)
     while (1) {
